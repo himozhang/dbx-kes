@@ -9,6 +9,7 @@ node_modules
 .superpowers/
 .trellis/
 .worktrees/
+.trae/
 openspec/
 .zcode/
 .mcp.json
