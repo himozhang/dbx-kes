@@ -7,9 +7,10 @@ import { Dialog, DialogContent, DialogFooter, DialogHeader, DialogTitle } from "
 import { Input } from "@/components/ui/input";
 import { usePlDebugStore } from "@/stores/plDebugStore";
 import type { PlDebugParam, PlDebugStartRequest } from "@/lib/backend/pl-debug-tauri";
-import type { PlDebugArgument, PlDebugInspectResult } from "@/lib/debug/plDebugProtocol";
+import type { PlDebugArgument, PlDebugInspectResult, PlDebugSourceField } from "@/lib/debug/plDebugProtocol";
 import { canonicalPlDebugScalarType, compositeArgumentShape, compositeInputComplete, compositeNode, emptyCompositeValue, type CompositeRoot, type CompositeValue } from "@/lib/debug/plDebugComposite";
 import PlDebugCompositeEditor from "./PlDebugCompositeEditor.vue";
+import PlDebugJsonEditor from "./PlDebugJsonEditor.vue";
 
 const { t } = useI18n();
 const store = usePlDebugStore();
@@ -33,15 +34,23 @@ const props = defineProps<{
   allowTypePreparation?: boolean;
 }>();
 
-const emit = defineEmits<{ started: [debugId: string]; refresh: []; recover: []; prepareTypes: [] }>();
+const emit = defineEmits<{ started: [debugId: string]; recover: []; prepareTypes: [] }>();
 
-const selectedIndex = ref("");
+// 调试入口已经锁定了具体对象，直接使用第一个（也是唯一）候选签名，
+// 不再让用户在重载列表里选择。
 const drafts = ref<PlDebugParam[][]>([]);
 const candidates = computed(() => props.preview?.targetPreview?.candidates ?? []);
-const selected = computed(() => (selectedIndex.value === "" ? undefined : candidates.value[Number(selectedIndex.value)]));
-const editableParams = computed(() => (selectedIndex.value === "" ? [] : (drafts.value[Number(selectedIndex.value)] ?? [])));
+const selected = computed(() => candidates.value[0]);
+const editableParams = computed(() => drafts.value[0] ?? []);
 const anonymous = computed(() => props.objectType === "ANONYMOUS");
-const riskAccepted = ref(false);
+/** 只读签名行：告诉用户当前调试的是哪个对象，不提供重载切换。 */
+const signatureLabel = computed(() => {
+  const candidate = selected.value;
+  if (!candidate) return "";
+  const signature = candidate.signature;
+  const owner = signature.packageName ? `${signature.packageName}.` : "";
+  return `${signature.schema}.${owner}${signature.objectName}(${candidate.parameters.map((param) => `${param.name} ${param.mode} ${argumentType(signature, param)}`).join(", ")})`;
+});
 const starting = ref(false);
 const errorMessage = ref<string | null>(null);
 let previousCandidates: typeof candidates.value = [];
@@ -50,16 +59,106 @@ const signatureKey = (candidate: (typeof candidates.value)[number]) => {
   return JSON.stringify([signature.schema, signature.packageName, signature.objectName, signature.objectId, signature.subprogramId, signature.objectType, signature.arguments]);
 };
 
-function parameterDraft(param: PlDebugArgument, signature: (typeof candidates.value)[number]["signature"]): PlDebugParam {
-  const draft: PlDebugParam = { name: param.name ?? "", mode: param.mode, type: param.type, value: param.type === "PL/SQL BOOLEAN" ? "false" : "", ...(param.mode === "OUT" ? {} : { inputState: param.defaulted === "Y" ? "default" : "value" }) };
+/** json / jsonb 参数使用 JSON 编辑器而不是普通输入框。 */
+function isJsonParamType(type: string) {
+  return /^(jsonb?|jsonb?\s*\(.*\))$/i.test((type ?? "").trim()) || /\.(jsonb?)$/i.test((type ?? "").trim());
+}
+
+/** 源码里该参数实际引用到的 JSON 字段。 */
+function sourceFields(paramName: string): PlDebugSourceField[] {
+  const fields = selected.value?.sourceAnalysis?.jsonFields ?? [];
+  const key = paramName.toLowerCase();
+  return fields.filter((field) => field.parameter.toLowerCase() === key);
+}
+
+/**
+ * 按字段名生成贴近真实业务的测试值：主键/数量给数字，布尔标记给 true，
+ * 时间给可解析的时间戳字符串，其余给稳定的示例文本。
+ */
+function sampleJSONValue(path: string): unknown {
+  const key = (path.split(".").pop() ?? "").toLowerCase();
+  if (/^(is_|has_|can_|allow_|enable_|disable_)/.test(key) || /_(flag|enabled|deleted|valid)$/.test(key)) return true;
+  if (key === "id" || /_(id|count|qty|quantity|num|number|amount|price|total|age|score|seq|version)$/.test(key)) return 1;
+  if (/(_at|_time|_date)$/.test(key) || key === "date" || key === "time") return "2026-01-01 00:00:00";
+  if (key.includes("email")) return "test@example.com";
+  if (key.endsWith("name")) return "test";
+  return "test";
+}
+
+/** 只构建源码真正读取的键，未引用的字段不会出现。 */
+function buildJSONFromSource(paramName: string): string {
+  const fields = sourceFields(paramName);
+  const root: Record<string, unknown> = {};
+  for (const field of fields) {
+    const parts = field.path.split(".").filter(Boolean);
+    let cursor: Record<string, unknown> = root;
+    parts.forEach((part, index) => {
+      if (index === parts.length - 1) {
+        cursor[part] = sampleJSONValue(field.path);
+        return;
+      }
+      if (typeof cursor[part] !== "object" || cursor[part] === null) cursor[part] = {};
+      cursor = cursor[part] as Record<string, unknown>;
+    });
+  }
+  return JSON.stringify(root, null, 2);
+}
+
+const jsonHint = (param: PlDebugParam) => {
+  const analysis = selected.value?.sourceAnalysis;
+  if (!analysis?.available) return analysis?.message || t("plDebug.start.jsonSourceUnavailable");
+  const count = sourceFields(param.name).length;
+  return count > 0 ? t("plDebug.start.jsonGeneratedFrom", { count }) : t("plDebug.start.jsonNoSourceFields");
+};
+
+function regenerateJSON(param: PlDebugParam) {
+  param.value = buildJSONFromSource(param.name);
+}
+
+const NUMERIC_PARAM_TYPES = new Set(["SMALLINT", "INT", "INT2", "INT4", "INT8", "INTEGER", "BIGINT", "NUMBER", "NUMERIC", "DECIMAL", "DEC", "REAL", "FLOAT", "FLOAT4", "FLOAT8", "DOUBLE", "DOUBLE PRECISION", "MONEY", "SERIAL", "SMALLSERIAL", "BIGSERIAL"]);
+
+/** 本地日期（避免 UTC 偏移把“当天”变成前一天）。 */
+function localDateText() {
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return `${now.getFullYear()}-${pad(now.getMonth() + 1)}-${pad(now.getDate())}`;
+}
+
+/** 按数据类型给出可直接执行的默认入参，避免用户面对空白输入框。 */
+function defaultParamValue(type: string): string {
+  const normalized = canonicalPlDebugScalarType(
+    (type ?? "")
+      .trim()
+      .toUpperCase()
+      .replace(/\([^)]*\)/g, "")
+      .replace(/\s+/g, " ")
+      .trim(),
+  );
+  if (normalized === "PL/SQL BOOLEAN" || normalized === "BOOLEAN" || normalized === "BOOL") return "false";
+  // 时区类型使用结构化编辑器，默认值在 parameterDraft 里单独填充。
+  if (normalized.includes("TIME ZONE")) return "";
+  if (normalized === "DATE") return `${localDateText()}T00:00:00`;
+  if (normalized === "DATETIME" || normalized === "TIMESTAMP" || normalized === "TIMESTAMP WITHOUT TIME ZONE") return `${localDateText()}T00:00:00`;
+  if (normalized === "TIME" || normalized === "TIME WITHOUT TIME ZONE") return "00:00:00";
+  // 这两个类型是 IEEE-754 十六进制文本，给 1.0 的位模式。
+  if (normalized === "BINARY_FLOAT") return "3F800000";
+  if (normalized === "BINARY_DOUBLE") return "3FF0000000000000";
+  if (NUMERIC_PARAM_TYPES.has(normalized)) return "0";
+  return "";
+}
+
+function parameterDraft(candidate: (typeof candidates.value)[number], param: PlDebugArgument): PlDebugParam {
+  const draft: PlDebugParam = { name: param.name ?? "", mode: param.mode, type: param.type, value: defaultParamValue(param.type), ...(param.mode === "OUT" ? {} : { inputState: param.defaulted === "Y" ? "default" : "value" }) };
   if (param.mode !== "OUT") {
-    const shape = compositeArgumentShape(signature, param);
-    if (shape && compositeNode(signature, shape)) {
+    // json/jsonb 直接展开为 JSON 编辑器，值由源码引用清单自动生成。
+    if (isJsonParamType(param.type)) draft.value = buildJSONFromSource(param.name ?? "");
+    const shape = compositeArgumentShape(candidate.signature, param);
+    if (shape && compositeNode(candidate.signature, shape)) {
       draft.value = null;
-      draft.typedValue = emptyCompositeValue(signature, shape) as CompositeRoot;
+      draft.typedValue = emptyCompositeValue(candidate.signature, shape) as CompositeRoot;
     }
-    if (canonicalPlDebugScalarType(param.type) === "TIMESTAMP WITH TIME ZONE") draft.typedValue = { kind: "timestamp_tz", value: { local: "", offset: "+00:00", region: null } };
-    if (canonicalPlDebugScalarType(param.type) === "TIMESTAMP WITH LOCAL TIME ZONE") draft.typedValue = { kind: "timestamp_ltz", value: { instant: "" } };
+    if (canonicalPlDebugScalarType(param.type) === "TIMESTAMP WITH TIME ZONE") draft.typedValue = { kind: "timestamp_tz", value: { local: `${localDateText()}T00:00:00`, offset: "+00:00", region: null } };
+    if (canonicalPlDebugScalarType(param.type) === "TIMESTAMP WITH LOCAL TIME ZONE") draft.typedValue = { kind: "timestamp_ltz", value: { instant: `${localDateText()}T00:00:00Z` } };
   }
   return draft;
 }
@@ -71,6 +170,14 @@ function argumentType(signature: (typeof candidates.value)[number]["signature"],
 }
 function compositeComplete(param: PlDebugParam, index: number) {
   if (param.mode !== "OUT" && param.inputState === "value") {
+    if (isJsonParamType(param.type)) {
+      try {
+        JSON.parse(param.value ?? "");
+        return true;
+      } catch {
+        return false;
+      }
+    }
     if (param.type === "BINARY_FLOAT") return /^[0-9a-fA-F]{8}$/.test(param.value ?? "");
     if (param.type === "BINARY_DOUBLE") return /^[0-9a-fA-F]{16}$/.test(param.value ?? "");
   }
@@ -98,16 +205,13 @@ function updateTimezoneParam(param: PlDebugParam, field: "local" | "offset" | "r
 watch(
   () => props.preview,
   () => {
-    riskAccepted.value = false;
     errorMessage.value = null;
     if (!props.preview) return;
-    const previousSelection = selectedIndex.value === "" ? undefined : previousCandidates[Number(selectedIndex.value)];
     const previousDrafts = new Map(previousCandidates.map((candidate, index) => [signatureKey(candidate), drafts.value[index]]));
-    const selected = previousSelection ? candidates.value.findIndex((candidate) => signatureKey(candidate) === signatureKey(previousSelection)) : -1;
     drafts.value = candidates.value.map((candidate) => {
       const previous = previousDrafts.get(signatureKey(candidate));
       return candidate.parameters.map((argument, index) => {
-        const initial = parameterDraft(argument, candidate.signature);
+        const initial = parameterDraft(candidate, argument);
         const saved = previous?.[index];
         if (!saved) return initial;
         const draft = JSON.parse(JSON.stringify(saved)) as PlDebugParam;
@@ -116,13 +220,9 @@ watch(
       });
     });
     previousCandidates = candidates.value;
-    selectedIndex.value = selected >= 0 ? String(selected) : candidates.value.length === 1 ? "0" : "";
   },
   { immediate: true },
 );
-watch(selectedIndex, () => {
-  riskAccepted.value = false;
-});
 
 const title = computed(() => {
   const target = anonymous.value ? t("plDebug.launch.anonymousTitle") : props.packageName ? `${props.packageName}.${props.objectName}` : (props.objectName ?? "");
@@ -174,6 +274,26 @@ const previewError = computed(() => {
   if (selected.value?.parameterTransport === "not_implemented") return selected.value.message || t("plDebug.start.metadataUnavailable");
   return null;
 });
+const analysisFields = computed(() => selected.value?.sourceAnalysis?.jsonFields ?? []);
+function sqlLiteral(param: PlDebugParam): string {
+  if (param.mode === "OUT" || param.inputState === "null") return "NULL";
+  if (isJsonParamType(param.type) && param.inputState === "value" && !(param.value ?? "").trim()) return "NULL";
+  if (param.type === "PL/SQL BOOLEAN") return param.value === "true" ? "TRUE" : "FALSE";
+  if (param.typedValue?.kind === "boolean") return param.typedValue.value ? "TRUE" : "FALSE";
+  const value = (param.value ?? "").trim();
+  if (!value) return "NULL";
+  if (/^(number|int|serial|numeric|decimal|real|float|double|money)/i.test(param.type.trim()) && /^[-+]?\d+(\.\d+)?([eE][-+]?\d+)?$/.test(value)) return value;
+  return `'${value.replace(/'/g, "''")}'`;
+}
+/** 底部预览：与 agent 最终执行的目标语句保持一致（CALL / SELECT ... FROM DUAL）。 */
+const generatedCode = computed(() => {
+  if (anonymous.value) return (props.source ?? "").trim();
+  if (!selected.value) return "";
+  const signature = selected.value.signature;
+  const qualified = [signature.schema, signature.packageName, signature.objectName].filter(Boolean).join(".");
+  const call = `${qualified}(${editableParams.value.map(sqlLiteral).join(", ")})`;
+  return signature.objectType === "FUNCTION" ? `SELECT ${call} FROM DUAL;` : `CALL ${call};`;
+});
 const canStart = computed(
   () =>
     !starting.value &&
@@ -185,7 +305,6 @@ const canStart = computed(
     !previewError.value &&
     !!props.preview?.connectionRevision &&
     props.preview.capabilities.supported === true &&
-    riskAccepted.value &&
     (anonymous.value || (!!selected.value && editableParams.value.every(compositeComplete))),
 );
 
@@ -219,7 +338,7 @@ async function startDebug() {
     const database = props.database;
     const revision = props.preview!.connectionRevision;
     const fingerprint = JSON.stringify(request);
-    const isCurrent = () => open.value && riskAccepted.value && props.connectionId === connectionId && props.database === database && props.preview?.connectionRevision === revision && JSON.stringify(startRequest.value) === fingerprint;
+    const isCurrent = () => open.value && props.connectionId === connectionId && props.database === database && props.preview?.connectionRevision === revision && JSON.stringify(startRequest.value) === fingerprint;
     const result = await store.start(connectionId, database, request, { riskAccepted: true, expectedConnectionRevision: revision, isCurrent });
     if (isCurrent()) open.value = false;
     emit("started", result.debugId ?? "");
@@ -238,13 +357,7 @@ async function startDebug() {
         <DialogTitle>{{ title }}</DialogTitle>
       </DialogHeader>
       <div class="flex items-center gap-2">
-        <select v-if="!anonymous" v-model="selectedIndex" class="h-8 min-w-0 flex-1 rounded-md border bg-background px-2 text-sm" :disabled="starting || loading" :aria-label="t('plDebug.start.signature')">
-          <option value="" disabled>{{ t("plDebug.start.chooseSignature") }}</option>
-          <option v-for="(candidate, index) in candidates" :key="`${candidate.signature.objectId}:${candidate.signature.subprogramId}`" :value="String(index)">
-            {{ candidate.signature.schema }}.{{ candidate.signature.packageName ? `${candidate.signature.packageName}.` : "" }}{{ candidate.signature.objectName }}({{ candidate.parameters.map((param) => `${param.name} ${param.mode} ${argumentType(candidate.signature, param)}`).join(", ") }})
-          </option>
-        </select>
-        <Button variant="outline" size="sm" :disabled="starting || loading" @click="emit('refresh')">{{ t("plDebug.start.refresh") }}</Button>
+        <p v-if="!anonymous" class="min-w-0 flex-1 truncate font-mono text-xs text-muted-foreground" :title="signatureLabel">{{ signatureLabel }}</p>
         <Button v-if="allowTypePreparation && selected?.signature.signatureVersion !== 2" variant="outline" size="sm" :disabled="starting || loading" @click="emit('prepareTypes')">{{ t("plDebug.start.prepareTypes") }}</Button>
       </div>
       <pre v-if="anonymous" class="max-h-40 overflow-auto whitespace-pre-wrap break-all rounded-md border bg-muted/30 p-2 font-mono text-xs">{{ source }}</pre>
@@ -276,6 +389,12 @@ async function startDebug() {
                   <div v-if="param.inputState === 'value' && shapeFor(index) && selected && (param.typedValue?.kind === 'record' || param.typedValue?.kind === 'collection' || param.typedValue?.kind === 'object')" class="min-w-0 basis-full space-y-2 py-1">
                     <PlDebugCompositeEditor :model-value="param.typedValue" :signature="selected.signature" :shape="shapeFor(index)!" :label="param.name" :disabled="starting" @update:model-value="updateCompositeParam(param, $event)" />
                     <p v-if="!compositeComplete(param, index)" role="alert" class="text-sm text-destructive">{{ t("plDebug.start.compositeInvalid") }}</p>
+                  </div>
+                  <div v-else-if="param.inputState === 'value' && isJsonParamType(param.type)" class="min-w-0 basis-full space-y-1 py-1">
+                    <PlDebugJsonEditor :model-value="param.value ?? ''" :label="param.name" :disabled="starting" :hint="jsonHint(param)" @update:model-value="param.value = String($event)" />
+                    <Button v-if="sourceFields(param.name).length" variant="outline" size="sm" class="h-7 px-2 text-xs" :disabled="starting" @click="regenerateJSON(param)">
+                      {{ t("plDebug.start.jsonRegenerate") }}
+                    </Button>
                   </div>
                   <div v-else-if="param.inputState === 'value' && param.typedValue?.kind === 'timestamp_tz'" class="flex min-w-0 flex-1 flex-wrap gap-2">
                     <label class="min-w-48 flex-1 text-muted-foreground"
@@ -343,9 +462,20 @@ async function startDebug() {
       <p v-if="previewError" role="alert" class="text-sm text-destructive">{{ previewError }}</p>
       <slot name="compilation" />
       <p v-if="selected?.signature.typeBindings?.length" class="text-sm text-muted-foreground">{{ t("plDebug.start.compositeInitializerWarning") }}</p>
-      <label class="flex items-start gap-2 text-sm"
-        ><input v-model="riskAccepted" type="checkbox" class="mt-1" :disabled="starting || loading || !!previewError" /><span>{{ t("plDebug.start.riskAcknowledgement") }}</span></label
-      >
+      <div v-if="selected?.sourceAnalysis" class="rounded-md border bg-muted/20 p-2 text-xs">
+        <p class="font-medium">{{ t("plDebug.start.sourceAnalysis") }}</p>
+        <p v-if="!analysisFields.length" class="mt-1 text-muted-foreground">{{ selected.sourceAnalysis.message || t("plDebug.start.sourceAnalysisEmpty") }}</p>
+        <ul v-else class="mt-1 space-y-0.5">
+          <li v-for="field in analysisFields" :key="`${field.parameter}:${field.path}`" class="truncate" :title="field.evidence">
+            <span class="font-mono">{{ field.parameter }} → {{ field.path }}</span>
+            <span class="text-muted-foreground"> · {{ t("plDebug.start.sourceAnalysisLine", { line: field.line }) }}</span>
+          </li>
+        </ul>
+      </div>
+      <div v-if="generatedCode" class="space-y-1">
+        <p class="text-sm font-medium">{{ t("plDebug.start.generatedCode") }}</p>
+        <pre class="max-h-32 overflow-auto whitespace-pre-wrap break-all rounded-md border bg-muted/30 p-2 font-mono text-xs">{{ generatedCode }}</pre>
+      </div>
       <p v-if="errorMessage" class="text-xs text-destructive">{{ errorMessage }}</p>
       <DialogFooter>
         <Button v-if="store.recoveryRequired || store.pendingStart" variant="outline" :disabled="starting" @click="recoverDebug">{{ t("plDebug.start.recover") }}</Button>

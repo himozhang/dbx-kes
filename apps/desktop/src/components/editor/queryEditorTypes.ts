@@ -46,6 +46,14 @@ export interface QueryEditorProps {
   statementExecutionMarkers?: StatementExecutionMarker[];
   /** MongoDB query tabs: SQL mode uses the SQL statement splitter and formatter. */
   mongoQueryLanguage?: MongoQueryLanguage;
+  /** 包 DDL：可悬停调试的成员名（浮出「调试」按钮）。 */
+  debugHoverMembers?: Array<{ name: string; kind: "PROCEDURE" | "FUNCTION" }>;
+  /** 悬停浮层中调试按钮的文案。 */
+  debugHoverLabel?: string;
+  /** PL/SQL 函数/存储过程 DDL 页：允许点击行号左侧轨道切换断点。 */
+  breakpointsEnabled?: boolean;
+  /** 当前已设置的断点行号（1-based），由 plDebugStore 的待生效断点提供。 */
+  breakpointLines?: number[];
 }
 
 export type CompletionMetadataScope = Pick<SqlCompletionScope, "database" | "schema">;

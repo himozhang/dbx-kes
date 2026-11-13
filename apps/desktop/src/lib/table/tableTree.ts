@@ -898,6 +898,23 @@ const groupDefs: Array<{
     childType: "function",
   },
   {
+    // Kingbase requirement: the "程序包" group sits directly below "函数".
+    key: "__packages",
+    label: "tree.packages",
+    objectTypes: ["PACKAGE"],
+    nodeType: "group-packages",
+    childType: "package",
+  },
+  {
+    // #13239: package bodies live in their own group (PL/SQL Developer style)
+    // so browsing/editing the body no longer risks picking the spec.
+    key: "__package_bodies",
+    label: "tree.packageBodies",
+    objectTypes: ["PACKAGE_BODY"],
+    nodeType: "group-package-bodies",
+    childType: "package-body",
+  },
+  {
     key: "__internal_functions",
     label: "tree.internalFunctions",
     objectTypes: ["FUNCTION_INTERNAL"],
@@ -952,22 +969,6 @@ const groupDefs: Array<{
     objectTypes: ["JOB"],
     nodeType: "group-jobs",
     childType: "job",
-  },
-  {
-    key: "__packages",
-    label: "tree.packages",
-    objectTypes: ["PACKAGE"],
-    nodeType: "group-packages",
-    childType: "package",
-  },
-  {
-    // #13239: package bodies live in their own group (PL/SQL Developer style)
-    // so browsing/editing the body no longer risks picking the spec.
-    key: "__package_bodies",
-    label: "tree.packageBodies",
-    objectTypes: ["PACKAGE_BODY"],
-    nodeType: "group-package-bodies",
-    childType: "package-body",
   },
   {
     key: "__types",

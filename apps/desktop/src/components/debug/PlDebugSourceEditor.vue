@@ -34,6 +34,7 @@ const store = usePlDebugStore();
 const settingsStore = useSettingsStore();
 const connectionStore = useConnectionStore();
 const { isDark, themePalette } = useTheme();
+let offSessionEnd: (() => void) | null = null;
 
 /** 调试单步命令 → store 动作；与 App.vue 的窗口级分支共用同一份命令语义。 */
 const plDebugStepRunners: Record<PlDebugStepCommand, () => void> = {
@@ -230,7 +231,7 @@ async function mountEditor() {
         // 只读展示，挂上 gutter 只会让人把断点设到错误的对象上。当前行高亮仍然生效
         // （它就是这一帧停住的位置）。
         getSnapshot: () => ({ breakpointLines: frameView.value ? [] : nativeSourceContract.value ? store.nativeBreakpointLines : store.breakpointLines, currentLine: activeCurrentLine.value }),
-        isEnabled: () => store.hasSession && store.target !== null && frameView.value === null && (nativeSourceContract.value ? store.canChangeNativeBreakpoints : !store.busy && !store.recoveryRequired && store.publicSnapshot?.state === "paused"),
+        isEnabled: () => store.target !== null && frameView.value === null,
         toggleBreakpoint: (lineNum: number) => {
           // applyBreakpoints 已经写进 store.error（工具栏会显示），这里只需吞掉 rejection。
           void (nativeSourceContract.value ? store.toggleSourceBreakpoint(lineNum) : store.toggleBreakpoint(lineNum)).catch(() => {});
@@ -243,6 +244,28 @@ async function mountEditor() {
 
 onMounted(() => {
   void mountEditor();
+  // 调试会话结束后，若目标是存储过程/函数/Package 成员，提示"另存为测试用例"。
+  offSessionEnd = store.onSessionEnd(async (info) => {
+    const t = info.target;
+    if (!t.objectName || t.objectType === "ANONYMOUS") return;
+    if (!confirm(`是否将刚调试的「${t.objectName}」保存为测试用例？`)) return;
+    const caseName = `${t.objectName}_调试用例_${new Date().toISOString().slice(0, 19).replace(/[:T]/g, "-")}`;
+    // 按需加载：测试用例 store 会牵连 tauri 后端模块，静态引入会让纯展示场景也背上依赖。
+    const { usePlsqlTestCaseStore } = await import("@/stores/plsqlTestCaseStore");
+    await usePlsqlTestCaseStore().saveTestCase(info.connectionId, info.database, {
+      id: 0,
+      case_name: caseName,
+      schema_name: t.schema ?? "",
+      object_name: t.objectName,
+      object_type: t.objectType,
+      package_name: t.packageName,
+      pre_sql: null,
+      call_sql: info.callSql,
+      params_json: "[]",
+      expected_return: null,
+      note: "调试会话自动保存",
+    });
+  });
 });
 
 // Mount after the DOM shows the container: CodeMirror measures on creation, and
@@ -272,6 +295,10 @@ watch(
 
 onBeforeUnmount(() => {
   destroyEditor();
+  if (offSessionEnd) {
+    offSessionEnd();
+    offSessionEnd = null;
+  }
 });
 </script>
 

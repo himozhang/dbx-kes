@@ -270,6 +270,19 @@ export function useQueryEditorDocumentState(options: QueryEditorDocumentStateOpt
     view.value.dispatch({ selection: normalizedSelection, scrollIntoView });
   }
 
+  /** 目标行落在视口底部 1/4 时，把它滚到视口约 40% 处，保证对象出现在中上部分。 */
+  function centerRevealedLineWhenNearBottom(currentView: EditorViewType, offset: number) {
+    const coords = currentView.coordsAtPos(offset);
+    const scroller = currentView.scrollDOM;
+    if (!coords) return;
+    const viewportTop = scroller.getBoundingClientRect().top;
+    const viewportHeight = scroller.clientHeight;
+    if (viewportHeight <= 0) return;
+    const relativeTop = coords.top - viewportTop;
+    if (relativeTop < viewportHeight * 0.75) return;
+    scroller.scrollTop += relativeTop - viewportHeight * 0.4;
+  }
+
   /** Move cursor/scroll to a 1-based line/column, e.g. from a global content-search match. */
   function revealEditorSelection(line: number, column?: number) {
     const currentView = view.value;
@@ -281,6 +294,7 @@ export function useQueryEditorDocumentState(options: QueryEditorDocumentStateOpt
     const charColumn = Math.max(1, column ?? 1);
     const offset = Math.min(lineOffset + charColumn - 1, doc.length);
     currentView.dispatch({ selection: EditorSelection.cursor(offset), scrollIntoView: true });
+    centerRevealedLineWhenNearBottom(currentView, offset);
     focusEditorView(currentView);
   }
 

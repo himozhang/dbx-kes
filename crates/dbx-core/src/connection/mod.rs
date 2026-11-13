@@ -1819,6 +1819,37 @@ impl AppState {
         inspect(&connections.pools)
     }
 
+    /// Dispatch an arbitrary JSON-RPC method to the connection's Agent runtime.
+    ///
+    /// Used by capabilities that are not expressible as SQL (e.g. Kingbase
+    /// `log_browse_*` which reads server log files over the local filesystem or
+    /// SSH). The Agent must already be running for the connection; this call
+    /// reuses its existing pool rather than opening a new session.
+    pub async fn dispatch_agent_rpc(
+        &self,
+        connection_id: &str,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<serde_json::Value, String> {
+        let database = {
+            let configs = self.configs.read().await;
+            let config = configs.get(connection_id).ok_or_else(|| format!("连接不存在: {connection_id}"))?;
+            config.effective_database().map(|s| s.to_string())
+        };
+        let pool_key = self.get_or_create_pool(connection_id, database.as_deref()).await?;
+        let pool = self.pool_handle(&pool_key).await.ok_or_else(|| "连接池不可用，请先连接数据库".to_string())?;
+        let PoolKind::Agent(client) = pool else {
+            return Err("该连接类型不支持 Agent RPC".to_string());
+        };
+        let client = client.clone();
+        let mut guard = client.lock().await;
+        let result = guard
+            .call::<serde_json::Value>(method, params)
+            .await
+            .map_err(|error| format!("Agent RPC {method} 调用失败: {error}"))?;
+        Ok(result)
+    }
+
     /// Whether DBX currently holds a pool for `connection_id`, i.e. the
     /// connection is open right now.
     ///
@@ -3376,8 +3407,8 @@ impl AppState {
         claimant: &crate::query::pl_debug::PlDebugPreparation,
     ) -> Result<PreparedConnectionRuntime, String> {
         let config = self.configs.read().await.get(connection_id).cloned().ok_or("Connection config not found")?;
-        if !matches!(config.db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle) {
-            return Err("PL/SQL debugging requires an Oracle or OceanBase Oracle connection".into());
+        if !matches!(config.db_type, DatabaseType::Oracle | DatabaseType::OceanbaseOracle | DatabaseType::Kingbase) {
+            return Err("PL/SQL debugging requires an Oracle, OceanBase Oracle, or Kingbase connection".into());
         }
         if !self.connection_lifecycle_is_current(connection_id, lifecycle) {
             return Err("The original debug connection was disconnected or changed".into());

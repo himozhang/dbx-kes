@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "DBX",
+  "productName": "DBX-KES",
   "version": "0.6.69",
-  "identifier": "com.dbx.app",
+  "identifier": "com.dbx.kes",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:1420",
@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "DBX",
+        "title": "DBX-KES",
         "width": 1280,
         "height": 800,
         "minWidth": 900,

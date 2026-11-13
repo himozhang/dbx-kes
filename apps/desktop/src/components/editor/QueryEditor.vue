@@ -21,6 +21,7 @@ import { useQueryEditorCompletionKeys } from "./useQueryEditorCompletionKeys";
 import { useQueryEditorPointer } from "./useQueryEditorPointer";
 import { useQueryEditorTableDrop } from "./useQueryEditorTableDrop";
 import { createQueryEditorHoverContent } from "./queryEditorHoverContent";
+import { createQueryEditorBreakpointExtension, refreshQueryEditorBreakpointsEffect } from "@/lib/editor/queryEditorBreakpoints";
 import { useQueryEditorHover } from "./useQueryEditorHover";
 import { useQueryEditorObjectNavigation } from "./useQueryEditorObjectNavigation";
 
@@ -34,7 +35,7 @@ import { useQueryEditorCompletionMetadata } from "./useQueryEditorCompletionMeta
 import { ref, onMounted, onBeforeUnmount, onActivated, onDeactivated, watch, shallowRef, computed, nextTick } from "vue";
 import { useI18n } from "vue-i18n";
 
-import { EditorState as CodeMirrorEditorState, Transaction } from "@codemirror/state";
+import { Compartment, EditorState as CodeMirrorEditorState, Transaction } from "@codemirror/state";
 import type { Text } from "@codemirror/state";
 import type { EditorView as EditorViewType } from "@codemirror/view";
 import { search as cmSearch } from "@codemirror/search";
@@ -101,6 +102,7 @@ import { EDITOR_FONT_FAMILY_CSS_VAR, EDITOR_FONT_SIZE_CSS_VAR, editorDiagnosticC
 import { shouldShowStatementGutter } from "@/lib/editor/codemirrorStatementGutter";
 
 import { createQueryEditorSqlShortcutDomHandler, isCharacterProducingShortcut } from "@/lib/editor/queryEditorSqlShortcut";
+import { packageMemberDebugHover } from "@/lib/editor/packageMemberDebugHover";
 import { createQueryEditorReplaceShortcutBindings, createQueryEditorReplaceShortcutHandler, createQueryEditorSearchKeymap } from "@/lib/editor/queryEditorSearchKeymap";
 import { createQueryEditorEscapeHandler } from "@/lib/editor/queryEditorEscape";
 import { buildQueryEditorLineNumbersExtension, createQueryEditorLineNumberAlignmentExtension } from "@/lib/editor/queryEditorLineNumbers";
@@ -222,6 +224,10 @@ const emit = defineEmits<{
   editorStateFlushed: [];
   editorRevealConsumed: [];
   sendSelectionToAi: [sql: string];
+  /** 包 DDL 成员名悬停浮层点击“调试”。 */
+  debugHover: [name: string];
+  /** PL/SQL DDL 页点击断点轨道，切换该行断点。 */
+  "toggle-breakpoint": [line: number];
 }>();
 
 const editorRef = ref<HTMLDivElement>();
@@ -229,6 +235,12 @@ const editorRef = ref<HTMLDivElement>();
 useQueryEditorLayout(editorRef);
 
 const view = shallowRef<EditorViewType | null>(null);
+const breakpointCompartment = new Compartment();
+const breakpointExtension = () =>
+  createQueryEditorBreakpointExtension({
+    getLines: () => props.breakpointLines ?? [],
+    toggleBreakpoint: (line) => emit("toggle-breakpoint", line),
+  });
 const contextMenuOpen = ref(false);
 let contextMenuPointerCleanup: (() => void) | null = null;
 
@@ -2279,6 +2291,7 @@ const codeMirrorLifecycle = useQueryEditorCodeMirror({
         createQueryEditorNativeSelectionGuard(ViewPlugin, { enabled: isTauriRuntime() && isMacOS(), inputHandler: EditorView.inputHandler, finalizeClipboardText: (text) => clipboardLineEndings(text) }),
         initializedRuntime.runGutterComp.of(runStatementGutterExtension()),
         bookmarks.extension,
+        breakpointCompartment.of(props.breakpointsEnabled ? breakpointExtension() : []),
         initializedRuntime.lineNumbersComp.of(lineNumbersExtension(initialSettings.showLineNumbers)),
         createQueryEditorLineNumberAlignmentExtension(ViewPlugin),
         currentStatementFrameExtension,
@@ -2359,6 +2372,11 @@ const codeMirrorLifecycle = useQueryEditorCodeMirror({
             });
             return true;
           }),
+        ),
+        packageMemberDebugHover(
+          () => props.debugHoverMembers,
+          () => props.debugHoverLabel ?? "",
+          (target) => emit("debugHover", target.name),
         ),
         hoverTooltip((currentView, pos) => resolveSqlHoverTooltip(currentView, pos)),
         initializedRuntime.sqlSignatureComp.of(sqlExtensions.buildSqlSignatureExtension()),
@@ -2949,6 +2967,21 @@ watch(
   [queryEditorAppearanceSettings, () => isDark.value, () => themePalette.value, editorThemeAppearance],
   () => {
     void applyEditorAppearance();
+  },
+  { deep: true },
+);
+
+// PL/SQL DDL 页的断点轨道：切换标签页时启用/移除，断点行变化时重画。
+watch(
+  () => props.breakpointsEnabled,
+  (enabled) => {
+    view.value?.dispatch({ effects: breakpointCompartment.reconfigure(enabled ? breakpointExtension() : []) });
+  },
+);
+watch(
+  () => props.breakpointLines,
+  () => {
+    view.value?.dispatch({ effects: refreshQueryEditorBreakpointsEffect.of(null) });
   },
   { deep: true },
 );

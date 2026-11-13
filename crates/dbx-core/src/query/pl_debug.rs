@@ -772,9 +772,11 @@ pub async fn pl_debug_inspect_core(
         .ok_or("Connection not found")?;
     if !matches!(
         db_type,
-        crate::models::connection::DatabaseType::Oracle | crate::models::connection::DatabaseType::OceanbaseOracle
+        crate::models::connection::DatabaseType::Oracle
+            | crate::models::connection::DatabaseType::OceanbaseOracle
+            | crate::models::connection::DatabaseType::Kingbase
     ) {
-        return Err("PL/SQL debugging requires an Oracle or OceanBase Oracle connection".into());
+        return Err("PL/SQL debugging requires an Oracle, OceanBase Oracle, or Kingbase connection".into());
     }
     let preparation = request.target.as_ref().and_then(|target| target.metadata_preparation.as_deref());
     if preparation == Some("debug_compile") {

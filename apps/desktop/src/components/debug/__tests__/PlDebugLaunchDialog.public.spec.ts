@@ -168,13 +168,22 @@ function button(text: string): HTMLButtonElement {
   return found;
 }
 
+/**
+ * 对话框里已没有“刷新预览”按钮；重新发布同一个目标会让宿主重新 inspect，
+ * 并沿用现有的草稿合并逻辑。
+ */
+async function refreshPreview() {
+  plDebugLaunchTarget.value = { ...plDebugLaunchTarget.value! };
+  await nextTick();
+}
+
 async function openNamed() {
   await launchPlDebug(target);
   await vi.waitFor(() => expect(document.querySelector('input[aria-label="N"]')).not.toBeNull());
 }
 
 async function acceptRisk() {
-  [...document.querySelectorAll<HTMLInputElement>('input[type="checkbox"]')].find((input) => input.closest("label")?.textContent?.includes("I understand this program"))!.click();
+  // 风险确认已从对话框中移除：参数齐全即可直接启动。
   await nextTick();
 }
 
@@ -383,7 +392,7 @@ describe("public exact debugger launch dialog", () => {
     const refreshed = JSON.parse(JSON.stringify(selected)) as typeof selected;
     refreshed.signature.typeGraph!.nodes[0]!.constructorCalls!.constructors[0]!.parameters[0]!.name = "RENAMED";
     inspection = { ...inspection, targetPreview: { ...inspection.targetPreview!, candidates: [refreshed] } };
-    button("Refresh preview").click();
+    await refreshPreview();
     await vi.waitFor(() => expect(document.querySelector('input[aria-label="X.RENAMED"]')).not.toBeNull());
     expect(document.body.textContent).toContain("N");
     input("X.RENAMED", "9");
@@ -396,7 +405,7 @@ describe("public exact debugger launch dialog", () => {
     const retyped = JSON.parse(JSON.stringify(refreshed)) as typeof selected;
     retyped.signature.typeGraph!.nodes[0]!.constructorCalls!.constructors[0]!.parameters[0]!.type.ATTR_TYPE_NAME = "VARCHAR2";
     inspection = { ...inspection, targetPreview: { ...inspection.targetPreview!, candidates: [retyped] } };
-    button("Refresh preview").click();
+    await refreshPreview();
     await vi.waitFor(() => expect(document.querySelector('button[aria-label="X.RENAMED: Clear"]')).not.toBeNull());
     expect(document.querySelector<HTMLInputElement>('input[aria-label="X.RENAMED"]')!.value).toBe("9");
     (document.querySelector('button[aria-label="X.RENAMED: Clear"]') as HTMLButtonElement).click();
@@ -686,6 +695,7 @@ describe("public exact debugger launch dialog", () => {
     await vi.waitFor(() => expect(document.querySelector('input[aria-label="F"]')).not.toBeNull());
     await acceptRisk();
     input("F", "1.25");
+    await nextTick();
     expect(button("Start debugging").disabled).toBe(true);
     const text = type === "BINARY_FLOAT" ? "ff800000" : "fff0000000000000";
     input("F", text);
@@ -748,7 +758,7 @@ describe("public exact debugger launch dialog", () => {
     await vi.waitFor(() => expect(document.querySelector('select[aria-label="B"]')).not.toBeNull());
     expect(calls.filter((call) => call.path === "inspect").at(-1)!.body.target.metadataPreparation).toBe("type_only");
     expect(calls.filter((call) => call.path === "start")).toHaveLength(0);
-    expect(button("Start debugging").disabled).toBe(true);
+    expect(button("Start debugging").disabled).toBe(false);
     const select = document.querySelector<HTMLSelectElement>(value === "null" ? 'select[aria-label="B: Input mode"]' : 'select[aria-label="B"]')!;
     select.value = value;
     select.dispatchEvent(new Event("change", { bubbles: true }));
@@ -832,7 +842,7 @@ describe("public exact debugger launch dialog", () => {
 
   it("keeps exact signature, native parameter names and decimal text through explicit confirmation", async () => {
     await openNamed();
-    expect(button("Start debugging").disabled).toBe(true);
+    expect(button("Start debugging").disabled).toBe(false);
     expect(calls.find((call) => call.path === "inspect")?.body).toMatchObject({ connectionId: "conn", database: "APP", target: { schema: target.schema, objectName: target.objectName, packageName: target.packageName, objectType: "PROCEDURE" } });
     input("N", "9007199254740993.123456789");
     await acceptRisk();
@@ -852,32 +862,22 @@ describe("public exact debugger launch dialog", () => {
     });
   });
 
-  it("requires an overload choice and preserves independent drafts when switching", async () => {
+  it("uses the first inspected signature directly without an overload selector", async () => {
     inspection.targetPreview!.candidates.push(candidate(8));
     await launchPlDebug(target);
-    await vi.waitFor(() => expect(document.querySelector('select[aria-label="Routine signature"]')?.children).toHaveLength(3));
-    expect(document.querySelector('input[aria-label="N"]')).toBeNull();
-    const select = document.querySelector<HTMLSelectElement>('select[aria-label="Routine signature"]')!;
-    const choose = async (value: string) => {
-      select.value = value;
-      select.dispatchEvent(new Event("change", { bubbles: true }));
-      await nextTick();
-    };
-    await choose("0");
+    await vi.waitFor(() => expect(document.querySelector('input[aria-label="N"]')).not.toBeNull());
+    // 重载下拉已移除：直接展示当前对象的入参。
+    expect(document.querySelector('select[aria-label="Routine signature"]')).toBeNull();
     input("N", "42");
     await nextTick();
-    await choose("1");
-    expect(document.querySelector<HTMLInputElement>('input[aria-label="N"]')!.value).toBe("");
-    await choose("0");
     expect(document.querySelector<HTMLInputElement>('input[aria-label="N"]')!.value).toBe("42");
-    expect(button("Start debugging").disabled).toBe(true);
   });
 
   it("does not execute an anonymous editor block before explicit confirmation", async () => {
     const source = "\nBEGIN\n  NULL;\nEND;\n/";
     await launchPlDebugAnonymous({ ...target, selectedText: source, documentText: "SELECT 1" });
     await vi.waitFor(() => expect(document.querySelector("pre")?.textContent).toBe(source.replace(/\n\/$/, "")));
-    await vi.waitFor(() => expect(document.querySelector<HTMLInputElement>('input[type="checkbox"]')?.disabled).toBe(false));
+    await vi.waitFor(() => expect(button("Start debugging").disabled).toBe(false));
     expect(calls.filter((call) => call.path === "start")).toHaveLength(0);
     await acceptRisk();
     button("Start debugging").click();
@@ -897,14 +897,14 @@ describe("public exact debugger launch dialog", () => {
     expect(tab.open).not.toHaveBeenCalled();
   });
 
-  it("retains a matching signature draft across refreshed metadata and requires risk confirmation again", async () => {
+  it("retains a matching signature draft across refreshed metadata", async () => {
     await openNamed();
     input("N", "123.0000000000000000001");
     await acceptRisk();
-    button("Refresh preview").click();
+    await refreshPreview();
     await vi.waitFor(() => expect(calls.filter((call) => call.path === "inspect")).toHaveLength(2));
     await vi.waitFor(() => expect(document.querySelector<HTMLInputElement>('input[aria-label="N"]')?.value).toBe("123.0000000000000000001"));
-    expect(button("Start debugging").disabled).toBe(true);
+    await vi.waitFor(() => expect(button("Start debugging").disabled).toBe(false));
     expect(calls.filter((call) => call.path === "start")).toHaveLength(0);
   });
 

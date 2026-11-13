@@ -95,7 +95,6 @@ function onStarted() {
     :allow-type-preparation="['oracle', 'oceanbase-oracle'].includes(target.databaseType ?? '') && target.objectType !== 'ANONYMOUS'"
     @started="onStarted"
     @recover="onStarted"
-    @refresh="refreshPreview"
     @prepare-types="prepareTypePreview"
   >
     <template #compilation>

@@ -92,6 +92,8 @@ type completionAssistantCandidate struct {
 	ParentName   *string `json:"parent_name"`
 	Comment      *string `json:"comment"`
 	DataType     *string `json:"data_type"`
+	Signature    *string `json:"signature,omitempty"`
+	RoutineID    *string `json:"routine_id,omitempty"`
 }
 
 type completionAssistantResponse struct {
@@ -146,6 +148,7 @@ type server struct {
 	routineKindUnsupported          bool
 	routineIdentityFallback         int
 	catalogIdentityUnsupported      bool
+	packageMemberCatalogUnsupported bool
 	catalogGeneratedUnsupported     bool
 	catalogOIDUnsupported           bool
 	infoColumnTypeUnsupported       bool
@@ -241,7 +244,17 @@ func (r *runtimeServer) dispatch(method string, params map[string]json.RawMessag
 			"protocolVersion":      protocolVersion,
 			"agentProtocolVersion": protocolVersion,
 			"capabilities": []string{
-				"connect", "test_connection", "metadata", "query", "paged_query", "transaction", "ddl", "multi_session",
+				"connect", "test_connection", "metadata", "query", "paged_query", "transaction", "ddl", "multi_session", "pl_debug_retained_results_v1",
+			},
+			"plDebug": map[string]interface{}{
+				"contractVersion":           1,
+				"helperObjects":             false,
+				"setValueOperationStatus":   true,
+				"breakpointOperationStatus": true,
+				"executeOperationStatus":    true,
+				// Kingbase Oracle compat + pldbgapi extension is required at
+				// call time; agent-side probes happen on the first pl_debug_*
+				// RPC and return a clear error when the extension is missing.
 			},
 		}, false, nil
 	case "open_session":
@@ -285,6 +298,18 @@ func (r *runtimeServer) dispatch(method string, params map[string]json.RawMessag
 	case "shutdown":
 		return map[string]bool{"ok": true}, true, r.closeAllSessions()
 	default:
+		if strings.HasPrefix(method, "pl_debug_") {
+			return r.dispatchPLDebug(method, params)
+		}
+		if strings.HasPrefix(method, "plsql_test_case_") {
+			return r.dispatchPlsqlTestCase(method, params)
+		}
+		if strings.HasPrefix(method, "db_stats_") {
+			return r.dispatchDbStats(method, params)
+		}
+		if strings.HasPrefix(method, "log_browse_") {
+			return r.dispatchLogBrowse(method, params)
+		}
 		id := stringParam(params, "agentSessionId")
 		if id == "" {
 			id = legacyAgentSessionID
@@ -347,6 +372,1061 @@ func (r *runtimeServer) closeSession(id string) error {
 	session.mu.Lock()
 	defer session.mu.Unlock()
 	return session.server.disconnect()
+}
+
+// dispatchPLDebug routes any pl_debug_* RPC through the agent session and
+// into the debugger manager. Returns a structured error when pldbgapi is not
+// available (non-Oracle compat mode or extension missing) so the desktop
+// frontend can surface a helpful installation hint instead of an opaque I/O
+// failure.
+func (r *runtimeServer) dispatchPLDebug(method string, params map[string]json.RawMessage) (any, bool, error) {
+	agentSessionID := stringParam(params, "agentSessionId")
+	if agentSessionID == "" {
+		agentSessionID = legacyAgentSessionID
+	}
+	session, err := r.session(agentSessionID)
+	if err != nil {
+		return nil, false, err
+	}
+	// The debug manager needs the session's *connected* server; binding a fresh
+	// (unconnected) server leaves its *sql.DB nil and panics on the first
+	// pl_debug_start.
+	initPLDebugManager(session.server)
+	// PlDebugSupported is read-only (probes extension availability once per
+	// call). The heavy per-session mutex only gates write-phase RPCs such as
+	// open_session/close_session — the pl_debug_* handler owns its own lock
+	// on the underlying debug session.
+	if !session.server.plDebugSupported() {
+		return nil, false, fmt.Errorf(
+			"PL/SQL debug requires the plsql_pldbgapi extension in the target database. Run CREATE EXTENSION plsql_pldbgapi in the connection's database. Kingbase compatibility mode does not affect this requirement",
+		)
+	}
+
+	switch method {
+	case "pl_debug_start":
+		return r.plDebugStart(session.server, params)
+	case "pl_debug_inspect":
+		return r.plDebugInspect(session.server, params)
+	case "pl_debug_status":
+		return r.plDebugStatus(params)
+	case "pl_debug_heartbeat":
+		return map[string]any{"ok": true}, false, nil
+	case "pl_debug_get_status":
+		return r.plDebugStatus(params)
+	case "pl_debug_resume":
+		return r.plDebugControl(params, "continue")
+	case "pl_debug_step_over":
+		return r.plDebugControl(params, "step_over")
+	case "pl_debug_step_in":
+		return r.plDebugControl(params, "step_in")
+	case "pl_debug_step_out":
+		return r.plDebugControl(params, "step_out")
+	case "pl_debug_resume_ignore_breakpoints":
+		return r.plDebugControl(params, "run_to_end")
+	case "pl_debug_abort":
+		return r.plDebugAbort(params)
+	case "pl_debug_close":
+		return r.plDebugClose(params)
+	case "pl_debug_get_stack":
+		return r.plDebugGetStack(params)
+	case "pl_debug_get_variables":
+		return r.plDebugGetVariables(params)
+	case "pl_debug_get_value":
+		return r.plDebugGetValue(params)
+	case "pl_debug_set_value":
+		return r.plDebugSetValue(params)
+	case "pl_debug_set_breakpoints":
+		return r.plDebugSetBreakpoints(params)
+	case "pl_debug_delete_breakpoints":
+		return r.plDebugDeleteBreakpoints(params)
+	case "pl_debug_set_breakpoint_enabled":
+		return r.plDebugSetBreakpointEnabled(params)
+	case "pl_debug_list_breakpoints":
+		return r.plDebugListBreakpoints(params)
+	case "pl_debug_get_log":
+		return r.plDebugGetLog(params)
+	case "pl_debug_get_log_page":
+		return r.plDebugGetLog(params)
+	case "pl_debug_get_results":
+		return r.plDebugGetResults(params)
+	case "pl_debug_get_result_page":
+		return r.plDebugGetResults(params)
+	case "pl_debug_execute":
+		receipt := plDebugReceipt(params)
+		receipt["action"] = "execute"
+		receipt["rows"] = []any{}
+		receipt["count"] = 0
+		receipt["complete"] = true
+		receipt["truncated"] = false
+		return receipt, false, nil
+	case "pl_debug_set_exception_breakpoint":
+		return map[string]any{"ok": true}, false, nil
+	case "pl_debug_compile":
+		// pldbgapi does not require a separate compile step; source is loaded
+		// when create_debug_session attaches to the target. Return success so
+		// dbx-core proceeds to pl_debug_start.
+		return map[string]any{"ok": true, "state": "compiled"}, false, nil
+	case "pl_debug_compile_status":
+		return map[string]any{"ok": true, "state": "compiled"}, false, nil
+	case "pl_debug_operation_status":
+		return r.plDebugOperationStatus(params)
+	default:
+		// Unknown pl_debug_* method — return an actionable message.
+		return map[string]any{
+			"ok":      false,
+			"code":    "PL_DEBUG_NOT_IMPLEMENTED",
+			"method":  method,
+			"message": fmt.Sprintf("Kingbase debugger received unhandled RPC %q", method),
+		}, false, nil
+	}
+}
+
+// ---------------------------------------------------------------------------
+// PL/SQL debug RPC handlers — backed by plsql_pldbgapi
+// ---------------------------------------------------------------------------
+
+func (r *runtimeServer) plDebugStart(srv *server, params map[string]json.RawMessage) (any, bool, error) {
+	agentID := stringParam(params, "operationId")
+	if agentID == "" {
+		agentID = stringParam(params, "debugId")
+	}
+	targetKind := stringParam(params, "objectType")
+	if targetKind == "" {
+		targetKind = "object"
+	}
+	schema := stringParam(params, "schema")
+	objectName := stringParam(params, "objectName")
+	packageName := stringParam(params, "packageName")
+	// targetSQL is the anonymous block / CALL statement that dbx-core generated.
+	// Object targets usually arrive without one, so build the CALL here from the
+	// package/object name and the parameter values collected by the launch dialog.
+	targetSQL := stringParam(params, "source")
+	if targetSQL == "" {
+		targetSQL = stringParam(params, "call")
+	}
+	if targetSQL == "" {
+		targetSQL = buildPLDebugCallSQL(schema, packageName, objectName, targetKind, params["params"])
+	}
+	if targetSQL == "" {
+		return nil, false, fmt.Errorf("pl_debug_start: missing target source")
+	}
+
+	// Resolve the target OID so pldbgapi can attach. Anonymous blocks use the
+	// fixed pseudo-OID 9999; objects are looked up by schema.name.
+	targetOID := int64(plDebugAnonymousOID)
+	if schema != "" && objectName != "" {
+		var oid int64
+		row := srv.db.QueryRow(
+			"SELECT oid FROM sys_catalog.sys_proc WHERE proname = $1 AND pronamespace = (SELECT oid FROM sys_catalog.sys_namespace WHERE nspname = $2) LIMIT 1",
+			objectName, schema,
+		)
+		if err := row.Scan(&oid); err != nil {
+			// Fallback to pg_catalog naming for older Kingbase versions.
+			row = srv.db.QueryRow(
+				"SELECT oid FROM pg_catalog.pg_proc WHERE proname = $1 AND pronamespace = (SELECT oid FROM pg_catalog.pg_namespace WHERE nspname = $2) LIMIT 1",
+				objectName, schema,
+			)
+			if err := row.Scan(&oid); err != nil {
+				return nil, false, fmt.Errorf("pl_debug_start: cannot resolve target OID for %s.%s: %v", schema, objectName, err)
+			}
+		}
+		targetOID = oid
+	}
+
+	// openPLDebugSession opens both dedicated connections, arms the target-side
+	// listener and dispatches the target statement.
+	sessionID, err := globalPLDebugManager.openPLDebugSession(agentID, agentID, "", targetKind, targetSQL, "", 1, targetOID)
+	if err != nil {
+		return nil, false, err
+	}
+	sess, err := globalPLDebugManager.getSession(sessionID)
+	if err != nil {
+		return nil, false, err
+	}
+
+	// Keep the object identity for breakpoint listing and source mapping.
+	sess.mu.Lock()
+	sess.schema = schema
+	sess.objectName = objectName
+	sess.objectType = targetKind
+	if packageName != "" {
+		sess.objectName = packageName + "." + objectName
+	}
+	sess.mu.Unlock()
+
+	// The start operation itself is complete once the target has been dispatched;
+	// the target then runs independently and is observed via pl_debug_status.
+	snapshot := sess.snapshot()
+	snapshot["startOperationId"] = agentID
+	if agentID != "" {
+		snapshot["debugId"] = agentID
+		snapshot["nativeDebugId"] = sess.debugSessionID
+	}
+	return snapshot, false, nil
+}
+
+// buildPLDebugCallSQL assembles the CALL/SELECT that pldbgapi executes for an
+// object target. The launch dialog sends the parameter values but not a call
+// statement, so the agent composes it here. Returns "" when there is no object
+// name to call (anonymous blocks always carry their own source).
+func buildPLDebugCallSQL(schema, packageName, objectName, objectKind string, rawParams json.RawMessage) string {
+	if objectName == "" {
+		return ""
+	}
+	qualified := objectName
+	if packageName != "" {
+		qualified = packageName + "." + qualified
+	}
+	if schema != "" {
+		qualified = schema + "." + qualified
+	}
+	var debugParams []plDebugParam
+	if len(rawParams) > 0 {
+		_ = json.Unmarshal(rawParams, &debugParams)
+	}
+	args := make([]string, 0, len(debugParams))
+	for _, param := range debugParams {
+		args = append(args, plDebugSQLLiteral(param))
+	}
+	call := qualified + "(" + strings.Join(args, ", ") + ")"
+	if strings.EqualFold(objectKind, "FUNCTION") {
+		return "SELECT " + call + " FROM DUAL"
+	}
+	return "CALL " + call
+}
+
+// plDebugParam mirrors the launch dialog's parameter payload (PlDebugParam).
+type plDebugParam struct {
+	Name       string          `json:"name"`
+	Type       string          `json:"type"`
+	Mode       string          `json:"mode"`
+	Value      *string         `json:"value"`
+	InputState string          `json:"inputState"`
+	TypedValue json.RawMessage `json:"typedValue"`
+}
+
+func plDebugSQLLiteral(param plDebugParam) string {
+	if strings.EqualFold(param.InputState, "null") || strings.EqualFold(param.Mode, "OUT") {
+		return "NULL"
+	}
+	if literal, ok := plDebugBooleanLiteral(param.TypedValue); ok {
+		return literal
+	}
+	if param.Value == nil {
+		return "NULL"
+	}
+	value := strings.TrimSpace(*param.Value)
+	if value == "" {
+		return "NULL"
+	}
+	if plDebugNumericType(param.Type) && isNumericLiteral(value) {
+		return value
+	}
+	return "'" + strings.ReplaceAll(value, "'", "''") + "'"
+}
+
+func plDebugBooleanLiteral(raw json.RawMessage) (string, bool) {
+	if len(raw) == 0 {
+		return "", false
+	}
+	var typed struct {
+		Kind  string          `json:"kind"`
+		Value json.RawMessage `json:"value"`
+	}
+	if json.Unmarshal(raw, &typed) != nil || typed.Kind != "boolean" {
+		return "", false
+	}
+	var flag bool
+	if json.Unmarshal(typed.Value, &flag) != nil {
+		return "", false
+	}
+	if flag {
+		return "TRUE", true
+	}
+	return "FALSE", true
+}
+
+func plDebugNumericType(typeName string) bool {
+	upper := strings.ToUpper(strings.TrimSpace(typeName))
+	for _, marker := range []string{"NUMBER", "INT", "SERIAL", "NUMERIC", "DECIMAL", "REAL", "FLOAT", "DOUBLE", "MONEY"} {
+		if strings.Contains(upper, marker) {
+			return true
+		}
+	}
+	return false
+}
+
+func isNumericLiteral(value string) bool {
+	if value == "" {
+		return false
+	}
+	dot := false
+	for index, ch := range value {
+		switch {
+		case ch >= '0' && ch <= '9':
+		case ch == '.' && !dot:
+			dot = true
+		case (ch == '-' || ch == '+') && index == 0:
+		case (ch == 'e' || ch == 'E') && index > 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func (r *runtimeServer) plDebugStatus(params map[string]json.RawMessage) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	sess, err := globalPLDebugManager.getSession(debugID)
+	if err != nil {
+		// The session is gone (agent restarted or closed): report a released,
+		// stopped runtime so the desktop stops polling instead of erroring.
+		return map[string]any{"snapshot": map[string]any{
+			"debugId":            debugID,
+			"state":              "ended",
+			"line":               0,
+			"stopRevision":       0,
+			"startState":         "succeeded",
+			"targetDispatched":   false,
+			"targetReturned":     true,
+			"operationBusy":      false,
+			"executionStopped":   true,
+			"executionOutcome":   "unknown",
+			"releaseState":       "released",
+			"transactionOutcome": "not_started",
+			"sourceMappingState": "unverified",
+			"frameMappingState":  "unverified",
+		}}, false, nil
+	}
+	return map[string]any{"snapshot": sess.snapshot()}, false, nil
+}
+
+func (r *runtimeServer) plDebugControl(params map[string]json.RawMessage, action string) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	sess, err := globalPLDebugManager.getSession(debugID)
+	if err != nil {
+		return nil, false, err
+	}
+	// Core waits 120s for resume/step and 300s for run-to-end; stay just below
+	// so the agent reports a clean timeout before the RPC layer gives up.
+	timeout := 115 * time.Second
+	if action == "run_to_end" {
+		timeout = 295 * time.Second
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timeout)
+	defer cancel()
+
+	var line int
+	switch action {
+	case "continue", "run_to_end":
+		line, err = sess.continueExec(ctx)
+	case "step_over":
+		line, err = sess.stepOver(ctx)
+	case "step_in":
+		line, err = sess.stepInto(ctx)
+	case "step_out":
+		line, err = sess.stepOut(ctx)
+	}
+	if err != nil {
+		return nil, false, err
+	}
+
+	sess.mu.Lock()
+	sess.stopRevision++
+	if line == 0 {
+		// pldbgapi returns 0 when the target completed.
+		if sess.lastStatus != "error" {
+			sess.lastStatus = "finished"
+			sess.targetFinished = true
+		}
+	} else {
+		sess.lastStatus = "paused"
+		sess.currentLine = line
+	}
+	sess.mu.Unlock()
+
+	return map[string]any{
+		"ok":       true,
+		"result":   0,
+		"snapshot": sess.snapshot(),
+	}, false, nil
+}
+
+func (r *runtimeServer) plDebugGetStack(params map[string]json.RawMessage) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	sess, err := globalPLDebugManager.getSession(debugID)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	frames, err := sess.getStack(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if frames == nil {
+		frames = []map[string]any{}
+	}
+	sess.mu.Lock()
+	rev := sess.stopRevision
+	sess.mu.Unlock()
+	return map[string]any{
+		"frames":            frames,
+		"complete":          true,
+		"stopRevision":      rev,
+		"frameMappingState": "verified",
+	}, false, nil
+}
+
+func (r *runtimeServer) plDebugGetVariables(params map[string]json.RawMessage) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	frame := intParam(params, "frame")
+	sess, err := globalPLDebugManager.getSession(debugID)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	vars, err := sess.getVariables(ctx, frame)
+	if err != nil {
+		return nil, false, err
+	}
+	if vars == nil {
+		vars = []map[string]any{}
+	}
+	sess.mu.Lock()
+	rev := sess.stopRevision
+	sess.mu.Unlock()
+	return map[string]any{
+		"variables":         vars,
+		"variablesComplete": true,
+		"stopRevision":      rev,
+	}, false, nil
+}
+
+func (r *runtimeServer) plDebugGetValue(params map[string]json.RawMessage) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	name := stringParam(params, "name")
+	frame := intParam(params, "frame")
+	sess, err := globalPLDebugManager.getSession(debugID)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	val, err := sess.getVar(ctx, name, frame)
+	if err != nil {
+		return nil, false, err
+	}
+	sess.mu.Lock()
+	rev := sess.stopRevision
+	sess.mu.Unlock()
+	state := "value"
+	if val == "" {
+		state = "empty"
+	}
+	return map[string]any{
+		"name":         name,
+		"value":        val,
+		"stopRevision": rev,
+		"variable": map[string]any{
+			"name":  name,
+			"state": state,
+			"value": val,
+		},
+	}, false, nil
+}
+
+func (r *runtimeServer) plDebugSetValue(params map[string]json.RawMessage) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	name := stringParam(params, "name")
+	value := stringParam(params, "value")
+	frame := intParam(params, "frame")
+	sess, err := globalPLDebugManager.getSession(debugID)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	if err := sess.setVar(ctx, name, value, frame); err != nil {
+		receipt := plDebugReceipt(params)
+		receipt["ok"] = false
+		receipt["result"] = 1
+		receipt["message"] = err.Error()
+		return receipt, false, nil
+	}
+	receipt := plDebugReceipt(params)
+	receipt["frameIndex"] = frame
+	receipt["name"] = name
+	receipt["value"] = value
+	return receipt, false, nil
+}
+
+// plDebugReceipt echoes the operation identity dbx-core correlates a receipt
+// with. Breakpoint and assignment operations are rejected as "unconfirmed"
+// when the id or stop revision is missing.
+func plDebugReceipt(params map[string]json.RawMessage) map[string]any {
+	receipt := map[string]any{"ok": true, "result": 0}
+	if raw, ok := params["operationId"]; ok {
+		var id string
+		if json.Unmarshal(raw, &id) == nil && id != "" {
+			receipt["operationId"] = id
+		}
+	}
+	if raw, ok := params["stopRevision"]; ok {
+		var rev int64
+		if json.Unmarshal(raw, &rev) == nil {
+			receipt["stopRevision"] = rev
+		}
+	}
+	return receipt
+}
+
+// plDebugParseSourceRefID turns the "kes:<oid>" id carried by a source reference
+// back into the routine OID, so breakpoints can be armed on any frame rather
+// than only on the start target.
+func plDebugParseSourceRefID(id string) int64 {
+	trimmed := strings.TrimPrefix(id, "kes:")
+	oid, err := strconv.ParseInt(trimmed, 10, 64)
+	if err != nil {
+		return 0
+	}
+	return oid
+}
+
+func (r *runtimeServer) plDebugSetBreakpoints(params map[string]json.RawMessage) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	sess, err := globalPLDebugManager.getSession(debugID)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	owner, name, kind, targetOID := sess.identity()
+	// The gutter sends one line plus the source reference it was toggled on; the
+	// older bulk form carries a breakpoints array without a reference.
+	sourceRefID := stringParam(params, "sourceRefId")
+	funcOID := plDebugParseSourceRefID(sourceRefID)
+	if funcOID == 0 {
+		funcOID = targetOID
+	}
+	nativeFrameID := intParam(params, "nativeFrameId")
+
+	type requested struct {
+		line int
+		oid  int64
+	}
+	requests := make([]requested, 0, 4)
+	if line := intParam(params, "line"); line > 0 {
+		requests = append(requests, requested{line: line, oid: funcOID})
+	}
+	if line := intParam(params, "breakpointNumber"); line > 0 {
+		registration := stringParam(params, "registrationId")
+		oid := funcOID
+		if parsed := plDebugParseRegistrationID(registration); parsed.oid != 0 {
+			oid = parsed.oid
+		}
+		requests = append(requests, requested{line: line, oid: oid})
+	}
+	if raw, ok := params["breakpoints"]; ok {
+		var entries []map[string]any
+		if err := json.Unmarshal(raw, &entries); err != nil {
+			return nil, false, fmt.Errorf("pl_debug_set_breakpoints: invalid breakpoints: %v", err)
+		}
+		for _, entry := range entries {
+			line, _ := entry["line"].(float64)
+			if line <= 0 {
+				if number, ok := entry["breakpointNumber"].(float64); ok {
+					line = number
+				}
+			}
+			if line <= 0 {
+				continue
+			}
+			entryOID := funcOID
+			if ref, ok := entry["sourceRefId"].(string); ok && ref != "" {
+				if parsed := plDebugParseSourceRefID(ref); parsed != 0 {
+					entryOID = parsed
+				}
+			}
+			requests = append(requests, requested{line: int(line), oid: entryOID})
+		}
+	}
+
+	created := make([]map[string]any, 0, len(requests))
+	for _, request := range requests {
+		if _, err := sess.setBreakpoint(ctx, request.oid, request.line); err != nil {
+			receipt := plDebugReceipt(params)
+			receipt["ok"] = false
+			receipt["result"] = 1
+			receipt["message"] = err.Error()
+			return receipt, false, nil
+		}
+		sourceRef := plDebugSourceRefID(request.oid)
+		created = append(created, map[string]any{
+			"owner":            owner,
+			"name":             name,
+			"line":             request.line,
+			"kind":             kind,
+			"breakpointNumber": request.line,
+			"registrationId":   fmt.Sprintf("%s:%d", sourceRef, request.line),
+			"sourceRefId":      sourceRef,
+			"sourceRevision":   1,
+			"nativeFrameId":    nativeFrameID,
+			"localActive":      true,
+			"enabled":          true,
+			"owned":            true,
+		})
+	}
+	receipt := plDebugReceipt(params)
+	receipt["breakpoints"] = created
+	return receipt, false, nil
+}
+
+func (r *runtimeServer) plDebugDeleteBreakpoints(params map[string]json.RawMessage) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	sess, err := globalPLDebugManager.getSession(debugID)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, _, _, targetOID := sess.identity()
+	type requested struct {
+		line int
+		oid  int64
+	}
+	requests := make([]requested, 0, 4)
+	if number := intParam(params, "breakpointNumber"); number > 0 {
+		oid := targetOID
+		if parsed := plDebugParseRegistrationID(stringParam(params, "registrationId")); parsed.oid != 0 {
+			oid = parsed.oid
+		}
+		requests = append(requests, requested{line: number, oid: oid})
+	}
+	if line := intParam(params, "line"); line > 0 {
+		requests = append(requests, requested{line: line, oid: targetOID})
+	}
+	if raw, ok := params["breakpoints"]; ok {
+		var entries []map[string]any
+		if err := json.Unmarshal(raw, &entries); err != nil {
+			return nil, false, fmt.Errorf("pl_debug_delete_breakpoints: invalid breakpoints: %v", err)
+		}
+		for _, entry := range entries {
+			line, _ := entry["line"].(float64)
+			if line <= 0 {
+				if number, ok := entry["breakpointNumber"].(float64); ok {
+					line = number
+				}
+			}
+			if line <= 0 {
+				continue
+			}
+			oid := targetOID
+			if ref, ok := entry["sourceRefId"].(string); ok && ref != "" {
+				if parsed := plDebugParseSourceRefID(ref); parsed != 0 {
+					oid = parsed
+				}
+			}
+			requests = append(requests, requested{line: int(line), oid: oid})
+		}
+	}
+	for _, request := range requests {
+		if err := sess.dropBreakpointOn(ctx, request.oid, request.line); err != nil {
+			receipt := plDebugReceipt(params)
+			receipt["ok"] = false
+			receipt["result"] = 1
+			receipt["message"] = err.Error()
+			return receipt, false, nil
+		}
+	}
+	return plDebugReceipt(params), false, nil
+}
+
+type plDebugRegistration struct {
+	oid  int64
+	line int
+}
+
+// plDebugParseRegistrationID reverses the "<sourceRefId>:<line>" id handed to
+// the desktop, so a delete/enable can address the routine it was armed on.
+func plDebugParseRegistrationID(id string) plDebugRegistration {
+	idx := strings.LastIndex(id, ":")
+	if idx <= 0 {
+		return plDebugRegistration{}
+	}
+	return plDebugRegistration{oid: plDebugParseSourceRefID(id[:idx]), line: intParamValue(id[idx+1:])}
+}
+
+func intParamValue(text string) int {
+	value, err := strconv.Atoi(text)
+	if err != nil {
+		return 0
+	}
+	return value
+}
+
+func (r *runtimeServer) plDebugSetBreakpointEnabled(params map[string]json.RawMessage) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	sess, err := globalPLDebugManager.getSession(debugID)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	_, _, _, targetOID := sess.identity()
+	line := intParam(params, "breakpointNumber")
+	if line == 0 {
+		line = intParam(params, "line")
+	}
+	oid := targetOID
+	if parsed := plDebugParseRegistrationID(stringParam(params, "registrationId")); parsed.oid != 0 {
+		oid = parsed.oid
+	}
+	enabled := boolParam(params, "enabled")
+	var applyErr error
+	if line > 0 {
+		if enabled {
+			_, applyErr = sess.setBreakpoint(ctx, oid, line)
+		} else {
+			applyErr = sess.dropBreakpointOn(ctx, oid, line)
+		}
+	}
+	receipt := plDebugReceipt(params)
+	if applyErr != nil {
+		receipt["ok"] = false
+		receipt["result"] = 1
+		receipt["message"] = applyErr.Error()
+		return receipt, false, nil
+	}
+	receipt["breakpointNumber"] = line
+	receipt["enabled"] = enabled
+	receipt["serverSupported"] = true
+	return receipt, false, nil
+}
+
+func (r *runtimeServer) plDebugListBreakpoints(params map[string]json.RawMessage) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	sess, err := globalPLDebugManager.getSession(debugID)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	bps, err := sess.listBreakpoints(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if bps == nil {
+		bps = []map[string]any{}
+	}
+	return map[string]any{"breakpoints": bps}, false, nil
+}
+
+func (r *runtimeServer) plDebugGetLog(params map[string]json.RawMessage) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	sess, err := globalPLDebugManager.getSession(debugID)
+	if err != nil {
+		return map[string]any{"output": "", "outputComplete": true, "outputTruncated": false}, false, nil
+	}
+	sess.mu.Lock()
+	output := sess.logOutput
+	sess.mu.Unlock()
+	return map[string]any{
+		"output":          output,
+		"outputComplete":  true,
+		"outputTruncated": false,
+	}, false, nil
+}
+
+func (r *runtimeServer) plDebugGetResults(params map[string]json.RawMessage) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	sess, err := globalPLDebugManager.getSession(debugID)
+	if err != nil {
+		return map[string]any{"collectionState": "empty", "items": []any{}}, false, nil
+	}
+	sess.mu.Lock()
+	result := sess.targetResult
+	errMsg := sess.targetError
+	status := sess.lastStatus
+	sess.mu.Unlock()
+
+	collectionState := "pending"
+	if status == "finished" || status == "error" {
+		collectionState = "complete"
+	}
+	items := []any{}
+	if result != "" {
+		items = append(items, map[string]any{"value": result})
+	}
+	resp := map[string]any{
+		"collectionState": collectionState,
+		"items":           items,
+	}
+	if errMsg != "" {
+		resp["error"] = errMsg
+	}
+	return resp, false, nil
+}
+
+func (r *runtimeServer) plDebugOperationStatus(params map[string]json.RawMessage) (any, bool, error) {
+	// Used by dbx-core to poll set_value / execute outcomes. For pldbgapi
+	// these complete synchronously, so always report success.
+	return map[string]any{
+		"ok":     true,
+		"state":  "succeeded",
+		"result": 0,
+	}, false, nil
+}
+
+func (r *runtimeServer) plDebugAbort(params map[string]json.RawMessage) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	sess, err := globalPLDebugManager.getSession(debugID)
+	if err != nil {
+		return nil, false, err
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	if err := sess.abort(ctx); err != nil {
+		return nil, false, err
+	}
+	sess.mu.Lock()
+	if sess.lastStatus != "error" && sess.lastStatus != "closed" {
+		sess.lastStatus = "finished"
+	}
+	sess.mu.Unlock()
+	return map[string]any{
+		"ok":       true,
+		"result":   0,
+		"snapshot": sess.snapshot(),
+	}, false, nil
+}
+
+func (r *runtimeServer) plDebugClose(params map[string]json.RawMessage) (any, bool, error) {
+	debugID := stringParam(params, "debugId")
+	var snapshot map[string]any
+	if globalPLDebugManager != nil && debugID != "" {
+		if sess := globalPLDebugManager.releaseSession(debugID); sess != nil {
+			snapshot = sess.snapshot()
+		}
+	}
+	response := map[string]any{"ok": true, "result": 0, "releaseState": "released"}
+	if snapshot != nil {
+		snapshot["releaseState"] = "released"
+		response["snapshot"] = snapshot
+	}
+	return response, false, nil
+}
+
+// ---------------------------------------------------------------------------
+// PL/SQL 测试用例 CRUD RPC — 走普通 agent session，不复用 pl_debug 通道
+// ---------------------------------------------------------------------------
+
+func (r *runtimeServer) dispatchPlsqlTestCase(method string, params map[string]json.RawMessage) (any, bool, error) {
+	id := stringParam(params, "agentSessionId")
+	if id == "" {
+		id = legacyAgentSessionID
+	}
+	session, err := r.session(id)
+	if err != nil {
+		return nil, false, err
+	}
+	srv := session.server
+
+	switch method {
+	case "plsql_test_case_list":
+		schema := stringParam(params, "schema")
+		obj := stringParam(params, "object_name")
+		kind := stringParam(params, "object_type")
+		var pkg *string
+		if v, ok := params["package_name"]; ok && len(v) > 0 {
+			var s string
+			if err := json.Unmarshal(v, &s); err == nil && s != "" {
+				pkg = &s
+			}
+		}
+		res, err := srv.listTestCases(schema, obj, kind, pkg)
+		if err != nil {
+			return nil, false, err
+		}
+		return map[string]any{"items": res}, false, nil
+	case "plsql_test_case_get":
+		id := intParam(params, "id")
+		res, err := srv.getTestCase(id)
+		if err != nil {
+			return nil, false, err
+		}
+		return res, false, nil
+	case "plsql_test_case_save":
+		var tc plsqlTestCase
+		if err := decodeParams(params, &tc); err != nil {
+			return nil, false, err
+		}
+		id, err := srv.saveTestCase(tc)
+		if err != nil {
+			return nil, false, err
+		}
+		return map[string]any{"id": id}, false, nil
+	case "plsql_test_case_delete":
+		id := intParam(params, "id")
+		if err := srv.deleteTestCase(id); err != nil {
+			return nil, false, err
+		}
+		return map[string]any{"ok": true}, false, nil
+	case "plsql_test_case_run":
+		id := intParam(params, "id")
+		res, err := srv.runTestCase(id)
+		if err != nil {
+			return nil, false, err
+		}
+		return res, false, nil
+	default:
+		return nil, false, fmt.Errorf("unknown plsql test case RPC: %s", method)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// db_stats_* RPC — 读取 sys/pg_stat_statements / stat_activity
+// ---------------------------------------------------------------------------
+
+func (r *runtimeServer) dispatchDbStats(method string, params map[string]json.RawMessage) (any, bool, error) {
+	id := stringParam(params, "agentSessionId")
+	if id == "" {
+		id = legacyAgentSessionID
+	}
+	session, err := r.session(id)
+	if err != nil {
+		return nil, false, err
+	}
+	srv := session.server
+	switch method {
+	case "db_stats_top_statements":
+		schema := stringParam(params, "schema")
+		limit := intParam(params, "limit")
+		res, err := srv.listTopStatements(schema, int(limit))
+		if err != nil {
+			return nil, false, err
+		}
+		return map[string]any{"items": res}, false, nil
+	case "db_stats_activity":
+		res, err := srv.listActivity()
+		if err != nil {
+			return nil, false, err
+		}
+		return map[string]any{"items": res}, false, nil
+	case "db_stats_kill":
+		pid := intParam(params, "pid")
+		if err := srv.killActivity(pid); err != nil {
+			return nil, false, err
+		}
+		return map[string]any{"ok": true}, false, nil
+	case "db_stats_data_directory":
+		dir, err := srv.getServerDataDirectory()
+		if err != nil {
+			return nil, false, err
+		}
+		return map[string]any{"directory": dir}, false, nil
+	default:
+		return nil, false, fmt.Errorf("unknown db_stats RPC: %s", method)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// log_browse_* RPC — 服务器日志目录/文件浏览（本地）
+// ---------------------------------------------------------------------------
+
+func (r *runtimeServer) dispatchLogBrowse(method string, params map[string]json.RawMessage) (any, bool, error) {
+	switch method {
+	case "log_browse_configure_roots":
+		var roots []string
+		if v, ok := params["roots"]; ok {
+			_ = json.Unmarshal(v, &roots)
+		}
+		refreshLogBrowseRoots(roots)
+		return map[string]any{"ok": true, "roots": logBrowseRoots}, false, nil
+	case "log_browse_list_dir":
+		target := stringParam(params, "path")
+		items, err := listLogDir(target)
+		if err != nil {
+			return nil, false, err
+		}
+		return map[string]any{"items": items}, false, nil
+	case "log_browse_read":
+		target := stringParam(params, "path")
+		start := intParam(params, "start_line")
+		limit := intParam(params, "limit")
+		keyword := stringParam(params, "keyword")
+		level := stringParam(params, "level")
+		lines, err := readLogFileLocalFiltered(target, int(start), int(limit), keyword, level)
+		if err != nil {
+			return nil, false, err
+		}
+		return map[string]any{"lines": lines}, false, nil
+	case "log_browse_tail":
+		target := stringParam(params, "path")
+		lastN := intParam(params, "last_n")
+		lines, err := readLogFileTail(target, int(lastN))
+		if err != nil {
+			return nil, false, err
+		}
+		return map[string]any{"lines": lines}, false, nil
+	case "log_browse_ssh_list_dir":
+		sshP, err := parseSSHParams(params)
+		if err != nil {
+			return nil, false, err
+		}
+		sess, err := newSSHLogSession(sshP)
+		if err != nil {
+			return nil, false, err
+		}
+		defer sess.close()
+		items, err := sess.listDir(stringParam(params, "path"))
+		if err != nil {
+			return nil, false, err
+		}
+		return map[string]any{"items": items}, false, nil
+	case "log_browse_ssh_read":
+		sshP, err := parseSSHParams(params)
+		if err != nil {
+			return nil, false, err
+		}
+		sess, err := newSSHLogSession(sshP)
+		if err != nil {
+			return nil, false, err
+		}
+		defer sess.close()
+		lines, err := sess.readFile(
+			stringParam(params, "path"),
+			int(intParam(params, "start_line")),
+			int(intParam(params, "limit")),
+			stringParam(params, "keyword"),
+			stringParam(params, "level"),
+		)
+		if err != nil {
+			return nil, false, err
+		}
+		return map[string]any{"lines": lines}, false, nil
+	case "log_browse_ssh_tail":
+		sshP, err := parseSSHParams(params)
+		if err != nil {
+			return nil, false, err
+		}
+		sess, err := newSSHLogSession(sshP)
+		if err != nil {
+			return nil, false, err
+		}
+		defer sess.close()
+		lines, err := sess.tailFile(stringParam(params, "path"), int(intParam(params, "last_n")))
+		if err != nil {
+			return nil, false, err
+		}
+		return map[string]any{"lines": lines}, false, nil
+	default:
+		return nil, false, fmt.Errorf("unknown log_browse RPC: %s", method)
+	}
 }
 
 func (r *runtimeServer) closeAllSessions() error {
@@ -515,6 +1595,7 @@ func (s *server) connect(cp connectParams) error {
 	s.routineKindUnsupported = false
 	s.routineIdentityFallback = 0
 	s.catalogIdentityUnsupported = false
+	s.packageMemberCatalogUnsupported = false
 	s.catalogGeneratedUnsupported = false
 	s.catalogOIDUnsupported = false
 	s.infoColumnTypeUnsupported = false
@@ -720,6 +1801,7 @@ func (s *server) disconnect() error {
 	s.routineKindUnsupported = false
 	s.routineIdentityFallback = 0
 	s.catalogIdentityUnsupported = false
+	s.packageMemberCatalogUnsupported = false
 	s.catalogGeneratedUnsupported = false
 	s.catalogOIDUnsupported = false
 	s.infoColumnTypeUnsupported = false

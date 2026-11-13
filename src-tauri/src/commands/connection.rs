@@ -3098,3 +3098,13 @@ pub async fn ensure_connection_writable(
     }
     Ok(())
 }
+
+#[tauri::command]
+pub async fn dispatch_agent_rpc(
+    state: State<'_, Arc<AppState>>,
+    connection_id: String,
+    method: String,
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    state.dispatch_agent_rpc(&connection_id, &method, params).await
+}

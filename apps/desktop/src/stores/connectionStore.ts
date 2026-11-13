@@ -8,7 +8,7 @@ import { DEFAULT_QUERY_TIMEOUT_SECS, normalizeManualTransactionTimeoutSecs } fro
 import { gaussdbConnectionMode } from "@/lib/database/jdbcDialect";
 import { exactOracleTriggerMetadata, exactOracleTriggerNodeMetadata, oracleTriggerIdentityKey, oracleTriggerReadOptions, oracleTriggerObjectReadOptions } from "@/lib/database/oracleTriggerIdentity";
 import { nativeJobAdminEngine } from "@/lib/database/nativeJobAdmin";
-import { supportsSchemaIndexManagement } from "@/lib/database/databaseObjectCapabilities";
+import { supportsPlsqlTestCases, supportsSchemaIndexManagement } from "@/lib/database/databaseObjectCapabilities";
 import { pagesTablePartitionsWithRootPage } from "@/lib/database/databaseFeatureSupport";
 import { notifyComponentUpdatesChanged } from "@/lib/updates/componentUpdateEvents";
 import type {
@@ -2048,7 +2048,9 @@ export const useConnectionStore = defineStore("connection", () => {
       node.type === "dameng-job-admin" ||
       node.type === "database-job-admin" ||
       node.type === "group-tablespaces" ||
-      node.type === "saved-sql-root"
+      node.type === "saved-sql-root" ||
+      node.type === "group-database-stats" ||
+      node.type === "group-log-browse"
     );
   }
 
@@ -2387,6 +2389,36 @@ export const useConnectionStore = defineStore("connection", () => {
     return { id: `${connectionId}:__native_jobs`, label: "tree.nativeJobs", type: "database-job-admin", connectionId, database: "", isExpanded: false };
   }
 
+  // KingbaseES 的连接级工具节点：数据库统计 + 日志浏览。
+  // 条件守卫集中在 supportsPlsqlTestCases — 与测试用例持久化用同一 gate。
+  function buildKingbaseDatabaseStatsNode(connectionId: string, existingConnectionNode?: TreeNode): TreeNode | undefined {
+    const config = getConfig(connectionId);
+    if (!supportsPlsqlTestCases(effectiveDatabaseTypeForConnection(config))) return undefined;
+    const existing = existingConnectionNode?.children?.find((child) => child.type === "group-database-stats");
+    return {
+      id: `${connectionId}:__kingbase_db_stats`,
+      label: "数据库性能",
+      type: "group-database-stats",
+      connectionId,
+      database: "",
+      isExpanded: existing?.isExpanded ?? false,
+    };
+  }
+
+  function buildKingbaseLogBrowseNode(connectionId: string, existingConnectionNode?: TreeNode): TreeNode | undefined {
+    const config = getConfig(connectionId);
+    if (effectiveDatabaseTypeForConnection(config) !== "kingbase") return undefined;
+    const existing = existingConnectionNode?.children?.find((child) => child.type === "group-log-browse");
+    return {
+      id: `${connectionId}:__kingbase_logs`,
+      label: "日志浏览",
+      type: "group-log-browse",
+      connectionId,
+      database: "",
+      isExpanded: existing?.isExpanded ?? false,
+    };
+  }
+
   function buildXuguTablespacesNode(connectionId: string, existingConnectionNode?: TreeNode): TreeNode | undefined {
     const config = getConfig(connectionId);
     if (effectiveDatabaseTypeForConnection(config) !== "xugu") return undefined;
@@ -2459,7 +2491,21 @@ export const useConnectionStore = defineStore("connection", () => {
     const damengRoleNode = buildDamengRoleNode(connectionId, existingConnectionNode);
     const damengJobAdminNode = buildDamengJobAdminNode(connectionId, existingConnectionNode);
     const xuguTablespacesNode = buildXuguTablespacesNode(connectionId, existingConnectionNode);
-    return [...nonUtilityChildren, buildOracleDatabaseLinksNode(connectionId, existingConnectionNode), buildDatabaseJobAdminNode(connectionId), userAdminNode, xuguUserAdminNode, damengUserNode, damengRoleNode, damengJobAdminNode, xuguTablespacesNode].filter(Boolean) as TreeNode[];
+    const kingbaseDbStatsNode = buildKingbaseDatabaseStatsNode(connectionId, existingConnectionNode);
+    const kingbaseLogBrowseNode = buildKingbaseLogBrowseNode(connectionId, existingConnectionNode);
+    return [
+      ...nonUtilityChildren,
+      buildOracleDatabaseLinksNode(connectionId, existingConnectionNode),
+      buildDatabaseJobAdminNode(connectionId),
+      kingbaseDbStatsNode,
+      kingbaseLogBrowseNode,
+      userAdminNode,
+      xuguUserAdminNode,
+      damengUserNode,
+      damengRoleNode,
+      damengJobAdminNode,
+      xuguTablespacesNode,
+    ].filter(Boolean) as TreeNode[];
   }
 
   function withSavedSqlRoot(connectionId: string, children: TreeNode[], existingConnectionNode?: TreeNode): TreeNode[] {
@@ -7703,9 +7749,10 @@ export const useConnectionStore = defineStore("connection", () => {
     if (!treeNodeInSidebarTree(node)) return;
     const packageOwnerId = packageMemberGroupOwnerId(node);
     const packageConfig = node.connectionId ? getConfig(node.connectionId) : undefined;
-    if (packageOwnerId && effectiveDatabaseTypeForConnection(packageConfig) === "xugu") {
+    const packageDbType = effectiveDatabaseTypeForConnection(packageConfig);
+    if (packageOwnerId && supportsPackageMemberExpansion(packageDbType, databaseCompatibilityMode(node.connectionId, node.database))) {
       const packageNode = findNode(treeNodes.value, packageOwnerId);
-      if (packageNode?.type === "package") await loadPackageMembers(packageNode, options);
+      if (packageNode?.type === "package") await loadPackageMembers(packageNode, options, node);
       return;
     }
 
@@ -9353,7 +9400,12 @@ export const useConnectionStore = defineStore("connection", () => {
     });
   }
 
-  async function loadPackageMembers(node: TreeNode, options?: LoadTreeOptions): Promise<void> {
+  /**
+   * 加载包的成员列表。`spinnerNode` 是触发这次加载的树节点（例如包下的
+   * “存储过程/函数”分组）：loading 应该显示在用户点击的节点上，而不是
+   * 把包节点整行变成 spinner。
+   */
+  async function loadPackageMembers(node: TreeNode, options?: LoadTreeOptions, spinnerNodeParam?: TreeNode): Promise<void> {
     if (node.type !== "package" || !node.connectionId || !node.database) return;
     const databaseType = effectiveDatabaseTypeForConnection(getConfig(node.connectionId));
     if (!supportsPackageMemberExpansion(databaseType, databaseCompatibilityMode(node.connectionId, node.database))) return;
@@ -9361,6 +9413,10 @@ export const useConnectionStore = defineStore("connection", () => {
     const database = node.database;
     const schema = node.schema;
     const packageName = node.objectName || node.label;
+    // 点击包下的分组时，把 loading 放在用户点击的分组节点上；注册在包节点上的
+    // load 句柄仅用于写回成员列表，避免把整行包节点变成 spinner。
+    const spinnerNode = spinnerNodeParam && spinnerNodeParam !== node ? spinnerNodeParam : null;
+    if (spinnerNode) spinnerNode.isLoading = true;
     let load = beginTreeNodeLoad(node);
 
     try {
@@ -9396,7 +9452,11 @@ export const useConnectionStore = defineStore("connection", () => {
           if (!targetNode) return;
           if (databaseType === "oceanbase-oracle" && response.fallback_used) throw new Error("OceanBase agent does not support package member completion; update the agent");
           if (databaseType === "oceanbase-oracle" && response.incomplete) throw new Error("Package has more than 1000 members; use a member prefix in SQL completion to narrow the results");
+          // setChildren 合并时会为“仍在加载”的旧分组保留旧 children；
+          // 刷新成员列表时必须用新结果覆盖，先临时摘掉 spinner 标记。
+          if (spinnerNode) spinnerNode.isLoading = false;
           setChildren(targetNode, buildPackageMemberNodes(targetNode, response.candidates, databaseType));
+          if (spinnerNode) spinnerNode.isLoading = true;
           targetNode.isExpanded = true;
         },
         options,
@@ -9406,6 +9466,7 @@ export const useConnectionStore = defineStore("connection", () => {
       throw error;
     } finally {
       finishTreeNodeLoad(load);
+      if (spinnerNode) spinnerNode.isLoading = false;
     }
   }
 

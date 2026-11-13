@@ -65,7 +65,8 @@ func detectKingbaseV7(db *sql.DB) bool {
 }
 
 type databaseInfo struct {
-	Name string `json:"name"`
+	Name              string  `json:"name"`
+	CompatibilityMode *string `json:"compatibility_mode,omitempty"`
 }
 
 type tableInfo struct {
@@ -330,25 +331,80 @@ func (s *server) listDatabases() ([]databaseInfo, error) {
 		kingbaseListDatabasesPostgresSQL,
 		"SELECT current_database()",
 	}
+	var names []string
 	for _, query := range queries {
 		rows, err := s.metadataQuery(query)
 		if err != nil {
 			continue
 		}
-		result := []databaseInfo{}
+		names = nil
 		for rows.Next() {
 			var name string
 			if rows.Scan(&name) == nil {
-				result = append(result, databaseInfo{Name: name})
+				names = append(names, name)
 			}
 		}
 		err = rows.Err()
 		_ = rows.Close()
-		if err == nil && len(result) > 0 {
-			return result, nil
+		if err == nil && len(names) > 0 {
+			break
 		}
 	}
-	return []databaseInfo{{Name: s.params.Database}}, nil
+	if len(names) == 0 {
+		return []databaseInfo{{Name: s.params.Database}}, nil
+	}
+
+	// Per-database compatibility mode. KingbaseES stores an explicit per-database
+	// `database_mode` override in pg_db_role_setting; otherwise the effective
+	// mode is the server default, which we already hold as s.mode.compatibilityMode.
+	modeByDB := s.queryDatabaseCompatibilityModes()
+	result := make([]databaseInfo, 0, len(names))
+	for _, name := range names {
+		mode := modeByDB[name]
+		if mode == "" {
+			mode = s.mode.compatibilityMode
+		}
+		info := databaseInfo{Name: name}
+		if mode != "" {
+			m := mode
+			info.CompatibilityMode = &m
+		}
+		result = append(result, info)
+	}
+	return result, nil
+}
+
+// queryDatabaseCompatibilityModes reads explicit per-database `database_mode`
+// overrides from pg_db_role_setting. Returns a map keyed by lowercased database
+// name. Databases without an explicit override are absent from the map.
+func (s *server) queryDatabaseCompatibilityModes() map[string]string {
+	catalog := "pg_catalog"
+	if !s.mode.postgresCatalog {
+		catalog = "sys_catalog"
+	}
+	query := fmt.Sprintf(`SELECT d.datname, e.setting
+		FROM %s.pg_db_role_setting s
+		JOIN %s.pg_database d ON d.oid = s.setdatabase
+		CROSS JOIN LATERAL unnest(s.setconfig) AS e(setting)
+		WHERE s.setrole = 0 AND e.setting LIKE 'database_mode=%%'`, catalog, catalog)
+	rows, err := s.metadataQuery(query)
+	if err != nil {
+		return map[string]string{}
+	}
+	defer rows.Close()
+	result := map[string]string{}
+	for rows.Next() {
+		var name, setting string
+		if err := rows.Scan(&name, &setting); err != nil {
+			continue
+		}
+		const prefix = "database_mode="
+		if !strings.HasPrefix(setting, prefix) {
+			continue
+		}
+		result[strings.ToLower(name)] = strings.TrimSpace(strings.TrimPrefix(setting, prefix))
+	}
+	return result
 }
 
 func kingbaseListSchemasSQL(mode kingbaseMode, showSystemSchemas bool) string {
@@ -1709,6 +1765,18 @@ func (s *server) listObjects(schema string, constraints metadataListConstraints)
 		}
 		result = append(result, types...)
 	}
+	// Kingbase exposes PACKAGE in both PG and Oracle modes. The specification and
+	// body are two facets of one package, so the tree gets a single PACKAGE row
+	// and never a separate PACKAGE_BODY row (includeBody=false).
+	// 仅在目标包含 PACKAGE（或未限定类型）时查询包目录，避免只取例程时
+	// 多一次无关查询、并让包目录故障影响例程列表。
+	if wantsPackageObjects(constraints) {
+		packages, pkgErr := s.listPackageObjects(effective, true, false)
+		if pkgErr != nil {
+			return nil, fmt.Errorf("list packages in schema %q: %w", effective, pkgErr)
+		}
+		result = append(result, packages...)
+	}
 	filtered := result[:0]
 	for _, item := range result {
 		if constraintsMatch(constraints, item.Name, item.ObjectType) {
@@ -1793,6 +1861,26 @@ func (s *server) completionAssistantSearch(request completionAssistantRequest) (
 				Name: column.Name, Kind: "COLUMN", Schema: stringPtr(schema), ParentSchema: stringPtr(schema),
 				ParentName: stringPtr(request.ParentName), Comment: column.Comment, DataType: &dataType,
 			})
+		}
+	} else if request.ParentName != "" && (kinds["routine"] || kinds["procedure"] || kinds["function"]) {
+		// Package member listing: procedures/functions owned by the named package.
+		members, err := s.listPackageMembers(request.Schema, request.ParentName, limit+1)
+		if err != nil {
+			return completionAssistantResponse{}, err
+		}
+		for _, member := range members {
+			if !completionNameMatches(member.Name, request) {
+				continue
+			}
+			kind := strings.ToLower(member.ObjectType)
+			candidates = append(candidates, completionAssistantCandidate{
+				Name: member.Name, Kind: kind, Schema: stringPtr(member.Schema),
+				ParentSchema: member.ParentSchema, ParentName: member.ParentName,
+				Signature: member.Signature,
+			})
+			if len(candidates) > limit {
+				return completionAssistantResponse{Candidates: candidates[:limit], Incomplete: true}, nil
+			}
 		}
 	} else {
 		schemas := []string{request.Schema}
@@ -2806,6 +2894,8 @@ func (s *server) getObjectSourceWithSignature(schema, name, objectType, relation
 		} else {
 			err = sql.ErrNoRows
 		}
+	} else if kind == "PACKAGE" || kind == "PACKAGE_BODY" {
+		source, err = s.getPackageSource(effective, name, kind)
 	}
 	if err != nil && err != sql.ErrNoRows {
 		return nil, err
@@ -3503,6 +3593,18 @@ func routineObjectType(value string) string {
 	default:
 		return ""
 	}
+}
+
+func wantsPackageObjects(constraints metadataListConstraints) bool {
+	if len(constraints.ObjectTypes) == 0 {
+		return true
+	}
+	for _, objectType := range constraints.ObjectTypes {
+		if strings.EqualFold(objectType, "PACKAGE") || strings.EqualFold(objectType, "PACKAGE_BODY") {
+			return true
+		}
+	}
+	return false
 }
 
 func constraintsMatch(constraints metadataListConstraints, name, kind string) bool {

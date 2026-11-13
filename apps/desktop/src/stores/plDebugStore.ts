@@ -1,5 +1,5 @@
 import { defineStore } from "pinia";
-import { computed, onScopeDispose, ref } from "vue";
+import { computed, onScopeDispose, ref, watch } from "vue";
 import * as backend from "@/lib/backend/api";
 import { formatError, normalizeBackendError } from "@/lib/backend/errorUtils";
 import type { PlDebugAction, PlDebugBootstrap, PlDebugCompileIntent, PlDebugCompileReceipt, PlDebugCompileRef, PlDebugInspectRequest, PlDebugReadRequest, PlDebugReceipt, PlDebugSessionRef, PlDebugSnapshot, PlDebugStartIntent, PlDebugValueContext, PlDebugVariable } from "@/lib/debug/plDebugProtocol";
@@ -180,6 +180,8 @@ export const usePlDebugStore = defineStore("plDebug", () => {
   const connectionId = ref<string | null>(null);
   const database = ref<string | null>(null);
   const target = ref<PlDebugSessionTarget | null>(null);
+  /** Callbacks invoked when a debug session is fully closed (after target ran). */
+  const sessionEndHandlers: Array<(info: { connectionId: string; database: string; target: PlDebugSessionTarget; callSql: string }) => void> = [];
   const probe = ref<PlDebugProbeResult | null>(null);
   let preparedProbe: { connectionId: string; database: string; result: PlDebugProbeResult } | null = null;
   let ruleEventContext = "";
@@ -228,6 +230,12 @@ export const usePlDebugStore = defineStore("plDebug", () => {
    */
   const stopSeq = ref(0);
   const breakpoints = ref<PlDebugLocalBreakpoint[]>([]);
+  /**
+   * 调试会话开始前在 DDL 编辑器里设置的断点（1-based 行号）。
+   * key 由 schema/packageName/objectName 组成；会话首次暂停并加载源码后自动
+   * 注册到服务端，注册成功后从待生效表中移除。
+   */
+  const pendingBreakpoints = ref<Record<string, number[]>>({});
   /**
    * Local (frontend-only) breakpoint properties, keyed by line. The server
    * never stores them: disabling a breakpoint keeps its entry here for a later
@@ -1178,6 +1186,49 @@ export const usePlDebugStore = defineStore("plDebug", () => {
   }
 
   /**
+   * DDL 编辑器断点（会话开始前）：按对象维度暂存行号，会话首次暂停并加载
+   * 源码后自动注册，避免用户必须先启动调试才能打断点。
+   */
+  function pendingBreakpointKey(object: Pick<PlDebugSessionTarget, "schema" | "packageName" | "objectName">): string {
+    return [object.schema ?? "", object.packageName ?? "", object.objectName ?? ""].map((part) => part.toUpperCase()).join("\u0000");
+  }
+  function pendingBreakpointLinesFor(object: Pick<PlDebugSessionTarget, "schema" | "packageName" | "objectName">): number[] {
+    return pendingBreakpoints.value[pendingBreakpointKey(object)] ?? [];
+  }
+  /** 包 DDL 页展示包体：汇总该包所有成员已暂存的断点行。 */
+  function pendingPackageBreakpointLines(schema: string | null | undefined, packageName: string): number[] {
+    const prefix = [schema ?? "", packageName].map((part) => part.toUpperCase()).join("\u0000") + "\u0000";
+    return Object.entries(pendingBreakpoints.value)
+      .filter(([key]) => key.startsWith(prefix))
+      .flatMap(([, lines]) => lines);
+  }
+  function togglePendingBreakpoint(object: Pick<PlDebugSessionTarget, "schema" | "packageName" | "objectName">, lineNum: number) {
+    const key = pendingBreakpointKey(object);
+    const current = pendingBreakpoints.value[key] ?? [];
+    const next = current.includes(lineNum) ? current.filter((line) => line !== lineNum) : [...current, lineNum].sort((left, right) => left - right);
+    if (next.length > 0) pendingBreakpoints.value = { ...pendingBreakpoints.value, [key]: next };
+    else {
+      const { [key]: _removed, ...rest } = pendingBreakpoints.value;
+      pendingBreakpoints.value = rest;
+    }
+  }
+  watch(
+    currentSourceRef,
+    (sourceRef) => {
+      const current = target.value;
+      if (!sourceRef || !current || !hasSession.value) return;
+      const key = pendingBreakpointKey(current);
+      const lines = pendingBreakpoints.value[key];
+      if (!lines?.length) return;
+      const { [key]: _consumed, ...rest } = pendingBreakpoints.value;
+      pendingBreakpoints.value = rest;
+      const additions = lines.filter((line) => !breakpoints.value.some((breakpoint) => breakpointBelongsToTarget(breakpoint, current) && breakpointLine(breakpoint) === line)).map((line) => breakpointForLine(current, line));
+      if (additions.length > 0) void applyBreakpoints([...breakpoints.value, ...additions]).catch(() => {});
+    },
+    { flush: "post" },
+  );
+
+  /**
    * Enables or disables the breakpoint on one line.
    *
    * The server-side primitive (`pl_debug_set_breakpoint_enabled`) toggles an
@@ -1872,6 +1923,19 @@ export const usePlDebugStore = defineStore("plDebug", () => {
     }
   }
 
+  /**
+   * Register a callback that fires when a debug session is fully closed after
+   * the target has executed. Used by the PL/SQL editor to offer "另存为测试用例"
+   * (save as test case) for the just-run routine.
+   */
+  function onSessionEnd(handler: (info: { connectionId: string; database: string; target: PlDebugSessionTarget; callSql: string }) => void): () => void {
+    sessionEndHandlers.push(handler);
+    return () => {
+      const i = sessionEndHandlers.indexOf(handler);
+      if (i >= 0) sessionEndHandlers.splice(i, 1);
+    };
+  }
+
   function reset() {
     if (
       recoveryProjectionRequired.value ||
@@ -1881,6 +1945,21 @@ export const usePlDebugStore = defineStore("plDebug", () => {
       (sessionRef.value && (publicSnapshot.value?.releaseState !== "released" || publicSnapshot.value.runtimeExited !== true || publicSnapshot.value.executionOutcome === "unknown"))
     ) {
       throw new Error("The unresolved debug session must be retained for recovery");
+    }
+    // Fire the session-end hook before tearing down state so editors can offer
+    // to persist the just-run routine as a PL/SQL test case.
+    if (sessionEndHandlers.length > 0 && target.value && connectionId.value) {
+      const t = target.value;
+      const callSql = t.source ?? (t.objectName ? buildDebugCallSql(t) : "");
+      const info = { connectionId: connectionId.value, database: database.value ?? "", target: t, callSql };
+      const handlers = [...sessionEndHandlers];
+      handlers.forEach((h) => {
+        try {
+          h(info);
+        } catch {
+          /* ignore handler errors */
+        }
+      });
     }
     stopHeartbeat();
     recoverySerial += 1;
@@ -1986,6 +2065,9 @@ export const usePlDebugStore = defineStore("plDebug", () => {
     setOwnedBreakpointEnabled,
     updateOwnedBreakpointRules,
     toggleBreakpoint,
+    pendingBreakpointLinesFor,
+    pendingPackageBreakpointLines,
+    togglePendingBreakpoint,
     setBreakpointEnabled,
     setBreakpointCondition,
     setBreakpointMessage,
@@ -2025,6 +2107,7 @@ export const usePlDebugStore = defineStore("plDebug", () => {
     clearError,
     close,
     reset,
+    onSessionEnd,
   };
 });
 
@@ -2201,6 +2284,18 @@ function sameBreakpoint(left: PlDebugBreakpoint, right: PlDebugBreakpoint): bool
 function targetProgramName(target: PlDebugSessionTarget): string {
   if (target.packageName && target.objectName) return `${target.packageName}.${target.objectName}`;
   return target.objectName ?? "";
+}
+
+/**
+ * Build a default CALL/SELECT skeleton for a debugged routine so it can be
+ * persisted as a PL/SQL test case when the session ends. The caller (editor)
+ * is expected to refine argument placeholders before saving.
+ */
+function buildDebugCallSql(target: PlDebugSessionTarget): string {
+  const schema = target.schema ? `${target.schema}.` : "";
+  const name = targetProgramName(target);
+  if (target.objectType === "FUNCTION") return `SELECT ${schema}${name}(/* args */);`;
+  return `CALL ${schema}${name}(/* args */);`;
 }
 
 function breakpointLine(breakpoint: PlDebugBreakpoint): number | null {

@@ -128,12 +128,12 @@ func TestRoutineMetadataCachesSignatureFunctionFallback(t *testing.T) {
 	for _, fallback := range []string{"pg", "oidvectortypes"} {
 		t.Run(fallback, func(t *testing.T) {
 			state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
-				for _, function := range []string{"sys_get_function_identity_arguments", "pg_get_function_identity_arguments"} {
+				for _, function := range []string{"sys_get_function_arguments", "pg_get_function_arguments"} {
 					if strings.Contains(query, function+"(") && (strings.HasPrefix(function, "sys_") || fallback == "oidvectortypes") {
 						return nil, &gokb.Error{Code: gokb.ErrorCode("42883"), Message: "function " + function + "(oid) does not exist"}
 					}
 				}
-				want := "pg_get_function_identity_arguments("
+				want := "pg_get_function_arguments("
 				if fallback == "oidvectortypes" {
 					want = "oidvectortypes("
 				}
@@ -165,7 +165,7 @@ func TestRoutineSourceUsesExplicitSignatureAndDetectsAmbiguity(t *testing.T) {
 	for _, signature := range []string{"", "value integer", "value \"Type's\""} {
 		t.Run(signature, func(t *testing.T) {
 			state := &metadataDriverState{query: func(query string) (driver.Rows, error) {
-				for _, fragment := range []string{"'team''s'", "'proc''s'", "p.prokind", "identity_arguments(", quoteLiteral(signature)} {
+				for _, fragment := range []string{"'team''s'", "'proc''s'", "p.prokind", "function_arguments(", quoteLiteral(signature)} {
 					if !strings.Contains(query, fragment) {
 						return nil, errors.New("routine source query lost a quoted identity component: " + query)
 					}
@@ -220,7 +220,7 @@ func TestLegacyRoutineSourceDoesNotIgnoreOverloadIdentity(t *testing.T) {
 				return nil, errors.New("legacy name-only DDL must not run for a mismatched signature: " + query)
 			}
 			var count int64 = 1
-			if strings.Contains(query, "identity_arguments(") {
+			if strings.Contains(query, "function_arguments(") {
 				count = 0
 			}
 			return &valueRows{columns: []string{"count"}, rows: [][]driver.Value{{count}}}, nil

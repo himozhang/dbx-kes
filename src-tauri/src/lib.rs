@@ -2625,6 +2625,7 @@ pub fn run() {
             commands::tab_runtime_cache::delete_tab_runtime_cache_owner,
             commands::tab_runtime_cache::delete_tab_runtime_cache,
             commands::query::execute_query,
+            commands::connection::dispatch_agent_rpc,
             commands::pl_debug::pl_debug_bootstrap,
             commands::pl_debug::pl_debug_inspect,
             commands::pl_debug::pl_debug_compile,

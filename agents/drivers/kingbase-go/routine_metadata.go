@@ -46,10 +46,12 @@ func (s *server) routineQueryContext(ctx context.Context, withIdentity bool, bui
 			kind = "CASE WHEN p.prorettype = 2278 THEN 'PROCEDURE' ELSE 'FUNCTION' END"
 			filter = "true"
 		}
-		identityFunction := prefix + "_get_function_identity_arguments"
+		// 使用带参数名的完整签名（如 `create_order(p_in_json jsonb)`）作为对象
+		// 签名，树节点与源码定位共用同一字符串，避免两处不一致。
+		identityFunction := prefix + "_get_function_arguments"
 		identity := identityFunction + "(p.oid)"
 		if s.routineIdentityFallback == 1 {
-			identityFunction = "pg_get_function_identity_arguments"
+			identityFunction = "pg_get_function_arguments"
 			identity = identityFunction + "(p.oid)"
 		} else if s.routineIdentityFallback == 2 {
 			identityFunction = "oidvectortypes"
@@ -64,7 +66,7 @@ func (s *server) routineQueryContext(ctx context.Context, withIdentity bool, bui
 			continue
 		}
 		if withIdentity && s.routineIdentityFallback < 2 && isUndefinedFunction(err, identityFunction) {
-			if identityFunction == "sys_get_function_identity_arguments" {
+			if identityFunction == "sys_get_function_arguments" {
 				s.routineIdentityFallback = 1
 			} else {
 				s.routineIdentityFallback = 2

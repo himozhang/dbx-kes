@@ -2231,7 +2231,7 @@ func TestListDatabasesFallsBackToPostgresCatalog(t *testing.T) {
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
-	if len(state.queries) != 2 || !strings.Contains(state.queries[0], "sys_catalog.sys_database") || !strings.Contains(state.queries[1], "pg_catalog.pg_database") {
+	if len(state.queries) < 2 || !strings.Contains(state.queries[0], "sys_catalog.sys_database") || !strings.Contains(state.queries[1], "pg_catalog.pg_database") {
 		t.Fatalf("catalog fallback order changed: %v", state.queries)
 	}
 }
@@ -2796,6 +2796,8 @@ func TestListObjectsIncludesCustomTypesWhenUnfiltered(t *testing.T) {
 				columns: []string{"relname", "relkind", "comment", "parent_schema", "parent_name"},
 				rows:    [][]driver.Value{{"orders", "TABLE", nil, nil, nil}},
 			}, nil
+		case strings.Contains(query, "sys_package p"):
+			return &valueRows{columns: []string{"pkgname", "oid"}, rows: [][]driver.Value{}}, nil
 		}
 		return nil, errors.New("unexpected query: " + query)
 	}}

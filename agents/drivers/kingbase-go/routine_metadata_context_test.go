@@ -46,7 +46,7 @@ func TestRoutineSourceSharesDeadlineAcrossCapabilityAndLegacyFallbacks(t *testin
 		if strings.Contains(query, "p.prokind") {
 			return nil, &gokb.Error{Code: gokb.ErrorCode("42703"), Message: "column p.prokind does not exist"}
 		}
-		for _, function := range []string{"sys_get_function_identity_arguments", "pg_get_function_identity_arguments", "sys_get_functiondef", "pg_get_functiondef"} {
+		for _, function := range []string{"sys_get_function_arguments", "pg_get_function_arguments", "sys_get_functiondef", "pg_get_functiondef"} {
 			if strings.Contains(query, function+"(") {
 				return nil, &gokb.Error{Code: gokb.ErrorCode("42883"), Message: "function " + function + "(oid) does not exist"}
 			}

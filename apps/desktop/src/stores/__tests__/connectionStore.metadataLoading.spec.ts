@@ -532,7 +532,11 @@ describe("connectionStore metadata loading", () => {
       match_mode: "prefix",
     });
     expect(packageNode.isExpanded).toBe(true);
-    expect(packageNode.children?.map((child) => child.label)).toEqual(["CALCULATE(P_VALUE IN NUMBER)", "CALCULATE(P_VALUE IN VARCHAR2)", "ITEM_COUNT"]);
+    expect(packageNode.children?.map((child) => [child.type, child.objectCount])).toEqual([
+      ["group-procedures", 2],
+      ["group-functions", 1],
+    ]);
+    expect(packageNode.children?.flatMap((group) => group.children ?? []).map((child) => child.label)).toEqual(["CALCULATE(P_VALUE IN NUMBER)", "CALCULATE(P_VALUE IN VARCHAR2)", "ITEM_COUNT"]);
   }, 15000);
 
   it("does not query package members for unsupported databases", async () => {

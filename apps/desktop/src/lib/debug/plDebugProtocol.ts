@@ -86,6 +86,28 @@ export interface PlDebugCompilePreview {
   state: "available" | "source_unavailable";
 }
 
+export interface PlDebugSourceField {
+  /** Parameter name the value is read from, as declared by the routine. */
+  parameter: string;
+  /** Dotted JSON path, e.g. `order.order_id`. */
+  path: string;
+  /** 1-based source line of the evidence. */
+  line: number;
+  /** Trimmed source line that references the field. */
+  evidence: string;
+}
+
+/**
+ * Source-level scan of a routine body. The launch dialog uses `jsonFields` to
+ * prefill json/jsonb arguments with only the keys the routine actually reads.
+ */
+export interface PlDebugSourceAnalysis {
+  available: boolean;
+  lineCount: number;
+  jsonFields: PlDebugSourceField[];
+  message?: string;
+}
+
 export interface PlDebugInspectResult {
   connectionRevision: string;
   capabilities: Record<string, unknown>;
@@ -107,6 +129,8 @@ export interface PlDebugInspectResult {
       returnValue: PlDebugArgument | null;
       parameterTransport: "implemented" | "not_implemented";
       message?: string;
+      /** 例程源码扫描结果；json/jsonb 参数据此自动生成测试数据。 */
+      sourceAnalysis?: PlDebugSourceAnalysis;
     }>;
   };
 }

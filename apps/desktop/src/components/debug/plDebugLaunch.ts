@@ -2,6 +2,7 @@ import { ref } from "vue";
 import i18n from "@/i18n";
 import { useToast } from "@/composables/useToast";
 import { usePlDebugStore } from "@/stores/plDebugStore";
+import { useConnectionStore } from "@/stores/connectionStore";
 import { resolvePlDebugAnonymousBlockText } from "@/lib/debug/plDebugAnonymousBlock";
 import type { PlDebugProbeResult } from "@/lib/backend/pl-debug-tauri";
 import type { DatabaseType } from "@/types/database";
@@ -48,7 +49,19 @@ export async function resolvePlDebugProbe(connectionId: string, database = ""): 
 }
 
 function canOpenPlDebug(target: { connectionId: string; database: string; databaseType?: DatabaseType }): boolean {
-  if (!supportsPlDebugRoutine(target.databaseType)) {
+  let compatibilityMode: string | undefined;
+  try {
+    // Pull compatibilityMode for Kingbase oracle-compat gates. Other databases
+    // ignore this param. We lazily access the store so non-Kingbase callers
+    // never pay the lookup.
+    if (target.databaseType === "kingbase") {
+      const connection = useConnectionStore().getConfig(target.connectionId);
+      compatibilityMode = connection?.database_info?.compatibilityMode;
+    }
+  } catch {
+    /* store not wired yet — fall back */
+  }
+  if (!supportsPlDebugRoutine(target.databaseType, compatibilityMode)) {
     useToast().toast(i18n.global.t("plDebug.launch.unsupported"), 5000);
     return false;
   }
