@@ -9,6 +9,11 @@ import { queryResultMessages } from "./queryResultMessages";
  */
 export function defaultViewForResult(result: Pick<QueryResult, "columns" | "rows" | "affected_rows" | "messages" | "server_message">): "messages" | "summary" {
   if (result.server_message === true && queryResultMessages(result).length > 0) return "messages";
+  // Kingbase/KES emit `RAISE NOTICE` as NOTICE-severity messages. Even when the
+  // block reports affected rows, there is no grid, so the log must be shown
+  // instead of a bare "executed successfully" summary.
+  const hasServerNotice = result.columns.length === 0 && result.rows.length === 0 && (result.messages ?? []).some((message) => (message.severity ?? "").toUpperCase() === "NOTICE");
+  if (hasServerNotice) return "messages";
   const messageOnly = result.columns.length === 0 && result.rows.length === 0 && result.affected_rows === 0 && (result.messages?.length ?? 0) > 0;
   return messageOnly ? "messages" : "summary";
 }

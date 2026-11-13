@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { computed, defineAsyncComponent, onBeforeUnmount, ref, shallowRef, watch } from "vue";
 import { useI18n } from "vue-i18n";
-import { Clipboard, Loader2, PencilLine, RefreshCw } from "@lucide/vue";
+import { Clipboard, Bug, Loader2, PencilLine, RefreshCw } from "@lucide/vue";
 import { useToast } from "@/composables/useToast";
 import { useConnectionStore } from "@/stores/connectionStore";
 import { useSettingsStore } from "@/stores/settingsStore";
@@ -18,13 +18,18 @@ import { assertSourceIdentity, beginSourceSave, captureSourceIdentity, renewSour
 import { jdbcRoutineMetadata, xuguRoutineMetadataFromDefinition, type RoutineMetadata } from "@/lib/table/routineParameters";
 import { executeWithProductionSqlGuard } from "@/lib/database/productionExecutionGuard";
 import { isOracleFamilyTypeSource } from "@/lib/database/databaseObjectCapabilities";
+import { launchPlDebug } from "@/components/debug/plDebugLaunch";
+import { parsePackageSourceMembers, type PackageSourceMember } from "@/lib/table/packageSourceMembers";
 import { requestOracleTypeManagement } from "@/lib/table/oracleTypeManagementRequest";
 import * as api from "@/lib/backend/api";
 import QueryEditor from "@/components/editor/QueryEditor.vue";
 import RoutineMetadataPanel from "@/components/objects/RoutineMetadataPanel.vue";
 import ObjectSourceSqlPreview from "@/components/objects/ObjectSourceSqlPreview.vue";
 import ObjectDependenciesPanel from "@/components/objects/ObjectDependenciesPanel.vue";
+import ObjectSourceTestCasesTab from "@/components/object/ObjectSourceTestCasesTab.vue";
 import { objectDependencyTarget, type ObjectDependencyTarget, type ObjectDetailsSection } from "@/lib/database/objectDependencyDetails";
+import { supportsPlsqlTestCases } from "@/lib/database/databaseObjectCapabilities";
+import { effectiveDatabaseTypeForConnection } from "@/lib/database/jdbcDialect";
 import { useQueryStore } from "@/stores/queryStore";
 import type { SqlObjectNavigationTarget } from "@/lib/sql/sqlNavigation";
 import { Button } from "@/components/ui/button";
@@ -156,6 +161,43 @@ const createScopes = computed(() =>
 let loadedSourceKey = "";
 /** May differ from props.objectType after PROCEDURE/FUNCTION/PACKAGE fallback resolution. */
 const resolvedObjectType = ref<ObjectSourceKind>(props.objectType);
+/** 仅函数/存储过程在 DDL 顶部工具条提供调试入口；程序包走包内成员调试。 */
+const debugObjectType = computed(() => (resolvedObjectType.value === "PROCEDURE" || resolvedObjectType.value === "FUNCTION" ? resolvedObjectType.value : null));
+function openDebugger() {
+  if (!debugObjectType.value) return;
+  void launchPlDebug({
+    connectionId: props.connectionId,
+    database: props.database,
+    databaseType: props.databaseType,
+    schema: props.schema,
+    objectType: debugObjectType.value,
+    objectName: props.name,
+  });
+}
+/** 包 DDL 左侧对象大纲：从源码解析成员，避免额外元数据请求。 */
+const packageOutlineMembers = computed(() => {
+  if (resolvedObjectType.value !== "PACKAGE" && resolvedObjectType.value !== "PACKAGE_BODY") return [];
+  return parsePackageSourceMembers(editing.value ? draft.value : content.value);
+});
+const packageDebugHoverMembers = computed(() => packageOutlineMembers.value.map((member) => ({ name: member.name, kind: member.kind })));
+function debugPackageMember(member: PackageSourceMember) {
+  void launchPlDebug({
+    connectionId: props.connectionId,
+    database: props.database,
+    databaseType: props.databaseType,
+    schema: props.schema,
+    objectType: member.kind,
+    objectName: member.name,
+    packageName: props.name,
+  });
+}
+function debugHoveredPackageMember(name: string) {
+  const member = packageOutlineMembers.value.find((candidate) => candidate.name.toLowerCase() === name.toLowerCase());
+  if (member) debugPackageMember(member);
+}
+function revealPackageMember(member: PackageSourceMember) {
+  sourceRevealRequest.value = { id: ++sourceRevealSequence, line: member.line, column: 1 };
+}
 let loadSerial = 0;
 let sourceIdentity: SourceIdentitySnapshot | undefined;
 onBeforeUnmount(() => {
@@ -168,6 +210,16 @@ const isViewLike = computed(() => props.objectType === "VIEW" || props.objectTyp
 const editLabel = computed(() => (isViewLike.value ? t("contextMenu.editView") : t("contextMenu.editObject")));
 const title = computed(() => `${props.createTrigger && !triggerSnapshot.value?.exists ? t("contextMenu.createTrigger") : editing.value ? editLabel.value : t("contextMenu.viewSource")} - ${triggerName.value}`);
 const hasRoutineMetadata = computed(() => !!routineMetadata.value && (routineMetadata.value.parameters.length > 0 || !!routineMetadata.value.returnType));
+
+// KingbaseES 下的 PL/SQL 目标对象（PROCEDURE / FUNCTION / PACKAGE / PACKAGE_BODY / ANONYMOUS）
+// 都可以把测试用例持久化到目标数据库里。其它对象 / 非 Kingbase 不展示 "测试用例" tab。
+const shouldShowTestCasesTab = computed(() => {
+  const config = connectionStore.getConfig(props.connectionId);
+  const dbType = effectiveDatabaseTypeForConnection(config);
+  if (!supportsPlsqlTestCases(dbType)) return false;
+  const allowed = new Set<ObjectSourceKind>(["PROCEDURE", "FUNCTION", "PACKAGE", "PACKAGE_BODY"]);
+  return allowed.has(resolvedObjectType.value);
+});
 
 watch(
   () => [props.open, props.connectionId, props.database, props.schema, props.catalog, props.executionSchema, props.name, props.relationName, props.signature, props.objectType, props.triggerIdentityMode, props.databaseType, props.initialEditing, props.initialSection] as const,
@@ -265,6 +317,21 @@ async function loadSource(nextEditing = props.initialEditing && canEdit.value, r
     editing.value = nextEditing && canEdit.value;
     if (nextEditing && !canEdit.value) {
       toast(t("objects.sourceReadOnly"), 3000);
+    }
+    // When opening a package from one of its members, jump to the member's
+    // declaration/definition within the package source. The member name is the
+    // identifier prefix of the signature (e.g. "fun_test(p_json_in jsonb)").
+    if ((resolvedType === "PACKAGE" || resolvedType === "PACKAGE_BODY") && target.signature) {
+      const memberName = target.signature.split("(")[0].trim();
+      if (memberName) {
+        const lines = formatted.split(/\r?\n/);
+        const escaped = memberName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const needle = new RegExp(`\\b${escaped}\\s*\\(`);
+        const lineIndex = lines.findIndex((line) => needle.test(line));
+        if (lineIndex >= 0) {
+          sourceRevealRequest.value = { id: ++sourceRevealSequence, line: lineIndex + 1, column: 1 };
+        }
+      }
     }
   } catch (e: any) {
     if (serial === loadSerial) {
@@ -495,11 +562,22 @@ defineExpose({ hasUnsavedDraft: () => editing.value && draft.value !== editableT
   />
   <Dialog :open="props.open" @update:open="(value) => emit('update:open', value)">
     <DialogContent class="h-[min(760px,calc(var(--dbx-viewport-height)-2rem))] grid-rows-[auto_minmax(0,1fr)_auto] sm:max-w-[900px]">
-      <DialogHeader>
+      <DialogHeader class="flex flex-row items-center justify-between gap-3 space-y-0">
         <DialogTitle>{{ title }}</DialogTitle>
+        <Button v-if="debugObjectType" variant="outline" size="sm" class="h-8 gap-1.5" data-object-source-debug @click="openDebugger">
+          <Bug class="h-4 w-4" />
+          {{ t("plDebug.launch.action") }}
+        </Button>
       </DialogHeader>
 
-      <ObjectDependenciesPanel :target="dependencyTarget" v-model:section="section" :open="props.open" @view-sql="viewDependencySql" @open-object="openDependencyObject">
+      <!-- 顶层 section 切换：源码 / 测试用例（仅 Kingbase Oracle 模式下 PL/SQL 对象可见） -->
+      <div v-if="shouldShowTestCasesTab" class="flex items-center gap-1 border-b border-border/60 px-3">
+        <button class="h-8 border-b-2 px-3 text-sm transition-colors" :class="section !== 'testCases' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'" @click="section = 'source'">源码</button>
+        <button class="h-8 border-b-2 px-3 text-sm transition-colors" :class="section === 'testCases' ? 'border-primary text-foreground' : 'border-transparent text-muted-foreground hover:text-foreground'" @click="section = 'testCases'">测试用例</button>
+      </div>
+
+      <!-- 源码 + 依赖面板 -->
+      <ObjectDependenciesPanel v-show="section !== 'testCases'" :target="dependencyTarget" v-model:section="section" :open="props.open" @view-sql="viewDependencySql" @open-object="openDependencyObject">
         <div v-if="isOracleTrigger && props.createTrigger" class="shrink-0 space-y-3 border-b pb-3 text-sm" data-trigger-create>
           <div class="grid grid-cols-1 gap-3 sm:grid-cols-3">
             <label class="space-y-1">{{ t("eventTrigger.owner") }}<Input v-model="createOwner" :disabled="saving || !!triggerSnapshot?.exists" data-trigger-create-owner /></label>
@@ -532,48 +610,80 @@ defineExpose({ hasUnsavedDraft: () => editing.value && draft.value !== editableT
             {{ t("common.retry") }}
           </Button>
         </div>
-        <div v-else-if="editing" class="object-source-dialog-editor flex min-h-0 flex-1 flex-col overflow-hidden rounded border" data-object-source-editor>
-          <QueryEditor
-            v-model="draft"
-            :reveal-request="sourceRevealRequest"
-            @editor-reveal-consumed="sourceRevealRequest = undefined"
-            class="min-h-0 flex-1"
-            :connection-id="props.connectionId"
-            :database="props.database"
-            :schema="props.schema || props.database"
-            :database-type="props.databaseType"
-            :dialect="props.dialect"
-            :format-dialect="props.formatDialect"
-            force-word-wrap
-            hide-execution-controls
-            @save="section === 'source' && saveSource()"
-          />
-          <div v-if="saveError" class="shrink-0 whitespace-pre-wrap break-words border-t px-3 py-2 text-xs text-destructive">
-            {{ saveError }}
+        <div v-else class="flex min-h-0 flex-1 gap-2 overflow-hidden">
+          <aside v-if="packageOutlineMembers.length" class="flex w-56 shrink-0 flex-col overflow-hidden rounded border" data-package-outline>
+            <div class="shrink-0 border-b bg-muted/40 px-2 py-1 text-xs font-medium text-muted-foreground">{{ t("plDebug.launch.objects") }}</div>
+            <div class="min-h-0 flex-1 overflow-auto p-1">
+              <div v-for="member in packageOutlineMembers" :key="`${member.kind}:${member.name}:${member.signature}`" class="group flex items-center gap-1 rounded px-1 py-0.5 hover:bg-accent">
+                <button type="button" class="min-w-0 flex-1 truncate text-left text-xs" :title="`${member.name}(${member.signature})`" @click="revealPackageMember(member)">
+                  <span class="font-mono">{{ member.name }}</span
+                  ><span v-if="member.signature" class="text-muted-foreground">({{ member.signature }})</span>
+                </button>
+                <button type="button" class="hidden shrink-0 items-center gap-0.5 rounded px-1 py-0.5 text-xs text-primary hover:bg-background group-hover:flex" :title="t('plDebug.launch.action')" @click="debugPackageMember(member)"><Bug class="h-3 w-3" />{{ t("plDebug.launch.action") }}</button>
+              </div>
+            </div>
+          </aside>
+          <div v-if="editing" class="object-source-dialog-editor flex min-h-0 min-w-0 flex-1 flex-col overflow-hidden rounded border" data-object-source-editor>
+            <QueryEditor
+              v-model="draft"
+              :reveal-request="sourceRevealRequest"
+              @editor-reveal-consumed="sourceRevealRequest = undefined"
+              class="min-h-0 flex-1"
+              :connection-id="props.connectionId"
+              :database="props.database"
+              :schema="props.schema || props.database"
+              :database-type="props.databaseType"
+              :dialect="props.dialect"
+              :format-dialect="props.formatDialect"
+              :debug-hover-members="packageDebugHoverMembers"
+              :debug-hover-label="t('plDebug.launch.action')"
+              force-word-wrap
+              hide-execution-controls
+              @debug-hover="debugHoveredPackageMember"
+              @save="section === 'source' && saveSource()"
+            />
+            <div v-if="saveError" class="shrink-0 whitespace-pre-wrap break-words border-t px-3 py-2 text-xs text-destructive">
+              {{ saveError }}
+            </div>
+          </div>
+          <div v-else class="flex min-h-0 min-w-0 flex-1 flex-col gap-3 overflow-hidden">
+            <RoutineMetadataPanel v-if="hasRoutineMetadata && routineMetadata" :parameters="routineMetadata.parameters" :return-type="routineMetadata.returnType" />
+            <QueryEditor
+              v-if="content || !hasRoutineMetadata"
+              :reveal-request="sourceRevealRequest"
+              @editor-reveal-consumed="sourceRevealRequest = undefined"
+              :key="`${props.connectionId}:${props.database}:${props.schema || ''}:${props.name}:${props.objectType}`"
+              :model-value="content"
+              class="object-source-dialog-editor min-h-0 flex-1 overflow-hidden rounded border"
+              :connection-id="props.connectionId"
+              :database="props.database"
+              :schema="props.schema || props.database"
+              :database-type="props.databaseType"
+              :dialect="props.dialect"
+              :format-dialect="props.formatDialect"
+              :debug-hover-members="packageDebugHoverMembers"
+              :debug-hover-label="t('plDebug.launch.action')"
+              force-word-wrap
+              read-only
+              hide-execution-controls
+              data-object-source-preview
+              @debug-hover="debugHoveredPackageMember"
+            />
           </div>
         </div>
-        <div v-else class="flex min-h-0 flex-1 flex-col gap-3 overflow-hidden">
-          <RoutineMetadataPanel v-if="hasRoutineMetadata && routineMetadata" :parameters="routineMetadata.parameters" :return-type="routineMetadata.returnType" />
-          <QueryEditor
-            v-if="content || !hasRoutineMetadata"
-            :reveal-request="sourceRevealRequest"
-            @editor-reveal-consumed="sourceRevealRequest = undefined"
-            :key="`${props.connectionId}:${props.database}:${props.schema || ''}:${props.name}:${props.objectType}`"
-            :model-value="content"
-            class="object-source-dialog-editor min-h-0 flex-1 overflow-hidden rounded border"
-            :connection-id="props.connectionId"
-            :database="props.database"
-            :schema="props.schema || props.database"
-            :database-type="props.databaseType"
-            :dialect="props.dialect"
-            :format-dialect="props.formatDialect"
-            force-word-wrap
-            read-only
-            hide-execution-controls
-            data-object-source-preview
-          />
-        </div>
       </ObjectDependenciesPanel>
+
+      <!-- Kingbase Oracle 模式 PL/SQL 对象的测试用例持久化面板 -->
+      <div v-if="shouldShowTestCasesTab && section === 'testCases'" class="min-h-0 flex-1 overflow-hidden">
+        <ObjectSourceTestCasesTab
+          :connection-id="props.connectionId"
+          :database="props.database"
+          :schema-name="props.schema || props.database"
+          :object-name="props.name"
+          :object-type="resolvedObjectType"
+          :package-name="props.objectType === 'PACKAGE_BODY' || props.objectType === 'PACKAGE' ? props.name : null"
+        />
+      </div>
 
       <DialogFooter>
         <Button variant="outline" @click="closeDialog">{{ t("common.close") }}</Button>

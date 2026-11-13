@@ -210,6 +210,7 @@ describe("treeNodeClick", () => {
       schema: "app_schema",
       objectType: "PACKAGE",
       signature: "p_value IN INT",
+      memberName: "calculate",
     });
   });
 

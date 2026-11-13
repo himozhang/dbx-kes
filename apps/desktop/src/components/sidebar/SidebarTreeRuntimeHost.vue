@@ -888,6 +888,49 @@ function databaseTypeForNode(node: TreeNode): DatabaseType | undefined {
   return node.connectionId ? effectiveDatabaseTypeForConnection(connectionStore.getConfig(node.connectionId)) : undefined;
 }
 
+/** PROCEDURE/FUNCTION children of a package node that can be debugged. */
+function packageMemberDebugTargets(node: TreeNode): Array<{ name: string; objectType: "PROCEDURE" | "FUNCTION" }> {
+  const packageName = node.objectName || node.label;
+  const targets: Array<{ name: string; objectType: "PROCEDURE" | "FUNCTION" }> = [];
+  for (const child of node.children ?? []) {
+    if (child.type !== "procedure" && child.type !== "function") continue;
+    if (child.parentName && child.parentName !== packageName) continue;
+    targets.push({
+      name: child.objectName || child.label,
+      objectType: child.type === "procedure" ? "PROCEDURE" : "FUNCTION",
+    });
+  }
+  return targets;
+}
+
+/** Loads package members on demand so the debug picker has something to show. */
+async function ensurePackageMembersLoaded(node: TreeNode): Promise<void> {
+  if (packageMemberDebugTargets(node).length > 0) return;
+  await connectionStore.loadPackageMembers(node);
+}
+
+function packageMemberDebugMenuItems(node: TreeNode): ContextMenuItem[] {
+  const targets = packageMemberDebugTargets(node);
+  if (targets.length === 0) {
+    return [{ label: t("plDebug.launch.unsupported"), disabled: true }];
+  }
+  return targets.map((member) => ({
+    label: member.name,
+    icon: Play,
+    action: () => {
+      void launchPlDebug({
+        connectionId: node.connectionId as string,
+        database: node.database as string,
+        databaseType: currentDatabaseType(),
+        schema: node.schema,
+        objectType: member.objectType,
+        objectName: member.name,
+        packageName: node.objectName || node.label,
+      });
+    },
+  }));
+}
+
 function sidebarTableCopyFormatOptions(node: TreeNode = activeNode.value): FormatSidebarTableNamesOptions {
   const config = node.connectionId ? connectionStore.getConfig(node.connectionId) : undefined;
   return {
@@ -975,6 +1018,10 @@ async function openDirectNavigationNode(node: TreeNode, requestId: number) {
     queryStore.openDamengJobAdmin(node.connectionId);
   } else if (node.type === "database-job-admin") {
     queryStore.openDatabaseJobAdmin(node.connectionId);
+  } else if (node.type === "group-database-stats") {
+    queryStore.openDatabaseStats(node.connectionId, node.database || "");
+  } else if (node.type === "group-log-browse") {
+    queryStore.openLogBrowse(node.connectionId, node.database || "");
   }
 }
 
@@ -3230,6 +3277,7 @@ function openObjectSourceDialog(initialEditing: boolean, viewPackageBody = false
       initialEditing,
       initialSection,
       request: { name: sourceTarget.name, objectType: sourceTarget.objectType, signature: sourceNode.signature },
+      revealMemberName: sourceTarget.memberName,
     });
     return;
   }
@@ -8622,6 +8670,17 @@ function buildObjectSidebarMenu(context: SidebarMenuFactoryContext): boolean {
     }
     if (node.type === "package" || node.type === "package-body") {
       items.push({ sidebarActionId: "contextMenu.editObject", label: t("contextMenu.editObject"), action: () => openObjectSourceDialog(true), icon: Pencil });
+    }
+    // A package is not directly callable, so "调试…" first resolves its
+    // PROCEDURE/FUNCTION members and then swaps the menu for a member picker.
+    if (node.type === "package" && node.connectionId && node.database && supportsPlDebugRoutine(currentDatabaseType())) {
+      items.push({
+        label: t("plDebug.start.title"),
+        icon: Play,
+        closeOnSelect: false,
+        action: () => ensurePackageMembersLoaded(node),
+        refreshItems: () => packageMemberDebugMenuItems(node),
+      });
     }
     items.push({ sidebarActionId: "contextMenu.viewSource", label: t("contextMenu.viewSource"), action: () => openObjectSourceDialog(false), icon: Code2 });
     if (canViewDatabaseObjectDependencies(currentDatabaseType(), node)) {

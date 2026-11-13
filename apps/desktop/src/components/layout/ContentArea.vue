@@ -54,6 +54,7 @@ import {
   AlignLeft,
   AlignRight,
   Binary,
+  Bug,
   PanelsTopLeft,
   Palette,
   CircleAlert,
@@ -62,6 +63,7 @@ import {
   SkipForward,
   ListX,
   LocateFixed,
+  Trash2,
 } from "@lucide/vue";
 import { Splitpanes, Pane } from "splitpanes";
 import { DynamicScroller, DynamicScrollerItem } from "vue-virtual-scroller";
@@ -166,12 +168,18 @@ const DatabaseJobAdmin = defineAsyncComponent(() => import("@/components/admin/D
 const DamengUserAdmin = defineAsyncComponent(() => import("@/components/admin/DamengUserAdmin.vue"));
 const DamengRoleAdmin = defineAsyncComponent(() => import("@/components/admin/DamengRoleAdmin.vue"));
 const SolrAdmin = defineAsyncComponent(() => import("@/components/solr/SolrAdmin.vue"));
+const DatabaseStatsPanel = defineAsyncComponent(() => import("@/components/sidebar/DatabaseStatsPanel.vue"));
+const LogBrowsePanel = defineAsyncComponent(() => import("@/components/sidebar/LogBrowsePanel.vue"));
 const PluginFilesystemTab = defineAsyncComponent(() => import("@/components/plugins/PluginFilesystemTab.vue"));
 const ExplainPlanViewer = defineAsyncComponent(() => import("@/components/explain/ExplainPlanViewer.vue"));
 const QueryChart = defineAsyncComponent(() => import("@/components/chart/QueryChart.vue"));
 const GraphResultView = defineAsyncComponent(() => import("@/components/graph/GraphResultView.vue"));
 import { useQueryStore } from "@/stores/queryStore";
 import { useConnectionStore } from "@/stores/connectionStore";
+import { usePlDebugStore } from "@/stores/plDebugStore";
+import { supportsPlDebugRoutine } from "@/lib/database/databaseFeatureSupport";
+import { addPackageMemberToSources, buildPackageOutline, packageOutlineMemberAtLine, removePackageMemberFromSources, type PackageOutlineMember } from "@/lib/table/packageSourceMembers";
+import { launchPlDebug } from "@/components/debug/plDebugLaunch";
 import { useProductionSafetyStore } from "@/stores/productionSafetyStore";
 import type { ContentAreaSurfaceEmits, ContentAreaSurfaceProps } from "@/components/layout/querySurfaces";
 import { TABLE_FONT_SIZE_MAX, TABLE_FONT_SIZE_MIN, useSettingsStore, type DataGridRowNumberMode, type DataGridSearchMode, type ResultRunDisplayMode } from "@/stores/settingsStore";
@@ -311,6 +319,131 @@ const emit = defineEmits<ContentAreaSurfaceEmits>();
 const { t } = useI18n();
 const queryStore = useQueryStore();
 const connectionStore = useConnectionStore();
+const plDebugStore = usePlDebugStore();
+
+/** PL/SQL 函数/存储过程 DDL 页的断点目标（包成员 DDL 走包页大纲，不在此列）。 */
+const routineDebugTarget = computed(() => {
+  const tab = props.activeTab;
+  const objectSource = tab.objectSource;
+  const objectType = objectSource?.objectType?.toUpperCase();
+  if (!objectSource || (objectType !== "PROCEDURE" && objectType !== "FUNCTION")) return null;
+  const connection = connectionStore.getConfig(tab.connectionId);
+  if (!supportsPlDebugRoutine(connection?.db_type, connection?.database_info?.compatibilityMode)) return null;
+  return { schema: objectSource.schema ?? tab.schema ?? null, packageName: null, objectName: objectSource.name };
+});
+const routineBreakpointLines = computed(() => {
+  const debugTarget = routineDebugTarget.value;
+  return debugTarget ? plDebugStore.pendingBreakpointLinesFor(debugTarget) : [];
+});
+/** 包的 DDL 页：左侧 header 列表 + 右侧包体，无论当前连接是否支持调试都要展示。 */
+const packageDdlTab = computed(() => {
+  const tab = props.activeTab;
+  const objectSource = tab.objectSource;
+  if (!objectSource || objectSource.objectType !== "PACKAGE") return null;
+  return { schema: objectSource.schema ?? tab.schema ?? null, name: objectSource.name };
+});
+/** 仅用于调试/断点：需要连接本身支持 PL/SQL 调试。 */
+const packageSourceTab = computed(() => {
+  const target = packageDdlTab.value;
+  if (!target) return null;
+  const connection = connectionStore.getConfig(props.activeTab.connectionId);
+  if (!supportsPlDebugRoutine(connection?.db_type, connection?.database_info?.compatibilityMode)) return null;
+  return target;
+});
+const packageOutlineMembers = computed<PackageOutlineMember[]>(() => {
+  const tab = props.activeTab;
+  if (!packageDdlTab.value || !tab.packageHeaderSource) return [];
+  return buildPackageOutline(tab.packageHeaderSource, tab.sql);
+});
+const packageDebugHoverMembers = computed(() => packageOutlineMembers.value.map((member) => ({ name: member.name, kind: member.kind })));
+const packageBreakpointLines = computed(() => {
+  const debugTarget = packageSourceTab.value;
+  return debugTarget ? plDebugStore.pendingPackageBreakpointLines(debugTarget.schema, debugTarget.name) : [];
+});
+const breakpointsEnabled = computed(() => routineDebugTarget.value !== null || (packageSourceTab.value !== null && packageOutlineMembers.value.length > 0));
+const breakpointLines = computed(() => (routineBreakpointLines.value.length > 0 ? routineBreakpointLines.value : packageBreakpointLines.value));
+function revealPackageMember(member: PackageOutlineMember) {
+  queryStore.revealActiveObjectSourceLine(member.bodyLine ?? member.line, member.name);
+}
+function debugPackageMember(member: PackageOutlineMember) {
+  const debugTarget = packageSourceTab.value;
+  const connection = connectionStore.getConfig(props.activeTab.connectionId);
+  if (!debugTarget || !connection) return;
+  void launchPlDebug({
+    connectionId: connection.id,
+    database: props.activeTab.database,
+    databaseType: connection.db_type,
+    schema: debugTarget.schema ?? undefined,
+    objectType: member.kind,
+    objectName: member.name,
+    packageName: debugTarget.name,
+  });
+}
+
+/** 左侧包子对象列表的新增/删除；两处改动会同步写回包头与包体。 */
+const packageMemberDialogOpen = ref(false);
+const packageMemberKind = ref<"PROCEDURE" | "FUNCTION">("PROCEDURE");
+const packageMemberName = ref("");
+const packageMemberParameters = ref("");
+const packageMemberReturnType = ref("INTEGER");
+const packageMemberDeleteOpen = ref(false);
+const packageMemberPendingDelete = ref<PackageOutlineMember | null>(null);
+const packageMemberNameValid = computed(() => /^[A-Za-z_][A-Za-z0-9_$#]*$/.test(packageMemberName.value.trim()));
+const packageMemberCreateDisabled = computed(() => !packageMemberNameValid.value || (packageMemberKind.value === "FUNCTION" && !packageMemberReturnType.value.trim()));
+
+function openPackageMemberDialog() {
+  packageMemberKind.value = "PROCEDURE";
+  packageMemberName.value = "";
+  packageMemberParameters.value = "";
+  packageMemberReturnType.value = "INTEGER";
+  packageMemberDialogOpen.value = true;
+}
+
+function createPackageMember() {
+  const tab = props.activeTab;
+  if (!packageDdlTab.value || !tab.packageHeaderSource || packageMemberCreateDisabled.value) return;
+  const result = addPackageMemberToSources(tab.packageHeaderSource, tab.sql, {
+    kind: packageMemberKind.value,
+    name: packageMemberName.value.trim(),
+    parameters: packageMemberParameters.value.trim(),
+    returnType: packageMemberReturnType.value.trim(),
+  });
+  queryStore.setPackageHeaderSource(tab.id, result.headerSource);
+  emit("editorUpdate", tab.id, result.bodySource);
+  packageMemberDialogOpen.value = false;
+}
+
+function requestDeletePackageMember(member: PackageOutlineMember) {
+  packageMemberPendingDelete.value = member;
+  packageMemberDeleteOpen.value = true;
+}
+
+function confirmDeletePackageMember() {
+  const member = packageMemberPendingDelete.value;
+  const tab = props.activeTab;
+  packageMemberDeleteOpen.value = false;
+  packageMemberPendingDelete.value = null;
+  if (!member || !packageDdlTab.value || !tab.packageHeaderSource) return;
+  const result = removePackageMemberFromSources(tab.packageHeaderSource, tab.sql, member);
+  queryStore.setPackageHeaderSource(tab.id, result.headerSource);
+  emit("editorUpdate", tab.id, result.bodySource);
+}
+function debugHoveredPackageMember(name: string) {
+  const member = packageOutlineMembers.value.find((candidate) => candidate.name.toLowerCase() === name.toLowerCase());
+  if (member) debugPackageMember(member);
+}
+function toggleRoutineBreakpoint(line: number) {
+  const debugTarget = routineDebugTarget.value;
+  if (debugTarget) {
+    plDebugStore.togglePendingBreakpoint(debugTarget, line);
+    return;
+  }
+  const packageTarget = packageSourceTab.value;
+  if (!packageTarget) return;
+  const member = packageOutlineMemberAtLine(packageOutlineMembers.value, line);
+  if (!member) return;
+  plDebugStore.togglePendingBreakpoint({ schema: packageTarget.schema, packageName: packageTarget.name, objectName: member.name }, line);
+}
 const productionSafetyStore = useProductionSafetyStore();
 function updateStructureDraft(draft: TableStructureEditorDraft | undefined, originTabId?: string) {
   const tab = originTabId === undefined ? props.activeTab : queryStore.tabs.find((item) => item.id === originTabId);
@@ -2395,69 +2528,119 @@ defineExpose({
                   {{ t("common.retry") }}
                 </Button>
               </div>
-              <QueryEditor
-                v-else
-                ref="queryEditorRef"
-                class="relative z-0 flex-1"
-                :auto-focus="sourceSectionActive && autoFocus !== false"
-                :model-value="activeTab.sql"
-                :tab-id="activeTab.id"
-                :connection-id="activeTab.connectionId"
-                :prefetch-completion="activeTab.mode === 'query' && !activeTab.sourceView"
-                :catalog="activeTab.catalog"
-                :database="activeTab.database"
-                :schema="activeTab.schema"
-                :client-session-id="activeTab.id"
-                :completion-context-version="activeTab.completionContextVersion"
-                :database-type="activeEffectiveDatabaseType"
-                :mongo-query-language="activeTab.mongoQueryLanguage"
-                :dialect="editorDialect"
-                :syntax-dialect="editorSyntaxDialect"
-                :format-dialect="activeSqlFormatDialect"
-                :format-request-id="formatSqlRequest?.tabId === activeTab.id ? formatSqlRequest.id : undefined"
-                :compress-request-id="compressSqlRequest?.tabId === activeTab.id ? compressSqlRequest.id : undefined"
-                :keyword-case-request-id="keywordCaseRequest?.tabId === activeTab.id ? keywordCaseRequest.id : undefined"
-                :keyword-case-request-mode="keywordCaseRequest?.tabId === activeTab.id ? keywordCaseRequest.mode : undefined"
-                :execution-error="activeQueryError"
-                :execution-error-sql="activeTab.lastExecutedSql"
-                :execution-error-result="activeQueryError ? activeTab.result : undefined"
-                :result-columns="activeTab.result?.columns"
-                :result-source-statement="activeTab.result?.sourceStatement"
-                :result-source-from="activeTab.result?.sourceFrom"
-                :result-source-to="activeTab.result?.sourceTo"
-                :statement-execution-markers="activeStatementExecutionMarkers"
-                :initial-viewport="activeTab.editorViewport"
-                :initial-selection="activeTab.editorSelection"
-                :reveal-request="activeTab.editorRevealRequest"
-                :force-word-wrap="activeTab.forceWordWrap"
-                :read-only="!!activeTab.ddlViewer || (managedTypeSource && (!activeTab.typeSourceEditing || unfinishedTypeChange || verifiedTypeDeletion))"
-                :hide-execution-controls="!!activeTab.ddlViewer || managedTypeSource"
-                enable-explain-shortcut
-                :can-explain="!activeTab.isExecuting && !activeTab.isExplaining && hasExecutableSql"
-                :is-executing="activeTab.isExecuting"
-                @update:model-value="emit('editorUpdate', activeTab.id, $event)"
-                @selection-change="emit('editorSelectionChange', activeTab.id, $event)"
-                @send-selection-to-ai="emit('sendSelectionToAi', activeTab.id, $event)"
-                @cursor-change="emit('editorCursorChange', activeTab.id, $event)"
-                @preview-changes-available="emit('previewChangesAvailable', activeTab.id, $event)"
-                @viewport-change="(viewport, tabId) => emit('editorViewportChange', tabId ?? activeTab.id, viewport)"
-                @selection-state-change="emit('editorSelectionStateChange', activeTab.id, $event)"
-                @editor-state-flushed="emit('editorStateFlushed', activeTab.id)"
-                @editor-reveal-consumed="clearEditorRevealRequest(activeTab)"
-                @format-error="emit('formatError', activeTab.id)"
-                @execute="sourceSectionActive && emit('execute', activeTab.id, $event)"
-                @execute-in-new-result-tab="sourceSectionActive && emit('executeInNewResultTab', activeTab.id, $event)"
-                @explain="sourceSectionActive && emit('explain', activeTab.id)"
-                @export-query="handleExportQuery"
-                @save="sourceSectionActive && emit('saveSql', props.activeTab.id)"
-                @click-table="onHandleClickTable"
-                @view-table-data="onHandleViewTableData"
-                @edit-table-structure="onHandleEditTableStructure"
-                @view-table-ddl="onHandleViewTableDdl"
-                @open-object-source="onHandleOpenObjectSource"
-                @click-column="onHandleClickColumn"
-                @close-column-panel="onHandleCloseColumnPanel"
-              />
+              <div v-else class="flex min-h-0 flex-1 gap-2 overflow-hidden">
+                <aside v-if="packageDdlTab" class="flex w-64 shrink-0 flex-col overflow-hidden rounded border" data-package-outline>
+                  <div class="flex shrink-0 items-center justify-between gap-1 border-b bg-muted/40 px-2 py-1">
+                    <span class="text-xs font-medium text-muted-foreground">{{ t("plDebug.launch.objects") }}</span>
+                    <button
+                      type="button"
+                      class="inline-flex h-5 w-5 items-center justify-center rounded text-muted-foreground hover:bg-background hover:text-foreground"
+                      :title="t('plDebug.launch.create')"
+                      :aria-label="t('plDebug.launch.create')"
+                      data-package-outline-create
+                      @click="openPackageMemberDialog"
+                    >
+                      <Plus class="h-3.5 w-3.5" />
+                    </button>
+                  </div>
+                  <div class="min-h-0 flex-1 overflow-y-auto">
+                    <table class="w-full table-fixed border-collapse text-xs" data-package-outline-table>
+                      <tbody>
+                        <tr
+                          v-for="member in packageOutlineMembers"
+                          :key="`${member.kind}:${member.name}:${member.signature}`"
+                          class="group cursor-pointer border-b border-border/50 last:border-b-0 hover:bg-accent"
+                          :class="activeTab.packageDebugMemberName === member.name ? 'bg-accent' : ''"
+                          @click="revealPackageMember(member)"
+                        >
+                          <td class="max-w-0 truncate px-2 py-1 font-mono" :title="`${member.name}(${member.signature})`">
+                            {{ member.name }}<span v-if="member.signature" class="text-muted-foreground">({{ member.signature }})</span>
+                          </td>
+                          <td class="w-14 shrink-0 whitespace-nowrap px-1 py-1 text-right">
+                            <span class="hidden items-center gap-0.5 group-hover:inline-flex">
+                              <button type="button" class="inline-flex items-center rounded px-1 py-0.5 text-primary hover:bg-background" :title="t('plDebug.launch.action')" @click.stop="debugPackageMember(member)">
+                                <Bug class="h-3 w-3" />
+                              </button>
+                              <button type="button" class="inline-flex items-center rounded px-1 py-0.5 text-destructive hover:bg-background" :title="t('plDebug.launch.delete')" @click.stop="requestDeletePackageMember(member)">
+                                <Trash2 class="h-3 w-3" />
+                              </button>
+                            </span>
+                          </td>
+                        </tr>
+                      </tbody>
+                    </table>
+                    <p v-if="!packageOutlineMembers.length" class="px-2 py-3 text-xs text-muted-foreground">{{ t("plDebug.launch.emptyMembers") }}</p>
+                  </div>
+                </aside>
+                <QueryEditor
+                  ref="queryEditorRef"
+                  class="relative z-0 min-h-0 flex-1"
+                  :auto-focus="sourceSectionActive && autoFocus !== false"
+                  :model-value="activeTab.sql"
+                  :tab-id="activeTab.id"
+                  :connection-id="activeTab.connectionId"
+                  :prefetch-completion="activeTab.mode === 'query' && !activeTab.sourceView"
+                  :catalog="activeTab.catalog"
+                  :database="activeTab.database"
+                  :schema="activeTab.schema"
+                  :client-session-id="activeTab.id"
+                  :completion-context-version="activeTab.completionContextVersion"
+                  :database-type="activeEffectiveDatabaseType"
+                  :mongo-query-language="activeTab.mongoQueryLanguage"
+                  :dialect="editorDialect"
+                  :syntax-dialect="editorSyntaxDialect"
+                  :format-dialect="activeSqlFormatDialect"
+                  :format-request-id="formatSqlRequest?.tabId === activeTab.id ? formatSqlRequest.id : undefined"
+                  :compress-request-id="compressSqlRequest?.tabId === activeTab.id ? compressSqlRequest.id : undefined"
+                  :keyword-case-request-id="keywordCaseRequest?.tabId === activeTab.id ? keywordCaseRequest.id : undefined"
+                  :keyword-case-request-mode="keywordCaseRequest?.tabId === activeTab.id ? keywordCaseRequest.mode : undefined"
+                  :execution-error="activeQueryError"
+                  :execution-error-sql="activeTab.lastExecutedSql"
+                  :execution-error-result="activeQueryError ? activeTab.result : undefined"
+                  :result-columns="activeTab.result?.columns"
+                  :result-source-statement="activeTab.result?.sourceStatement"
+                  :result-source-from="activeTab.result?.sourceFrom"
+                  :result-source-to="activeTab.result?.sourceTo"
+                  :statement-execution-markers="activeStatementExecutionMarkers"
+                  :initial-viewport="activeTab.editorViewport"
+                  :initial-selection="activeTab.editorSelection"
+                  :reveal-request="activeTab.editorRevealRequest"
+                  :force-word-wrap="activeTab.forceWordWrap"
+                  :read-only="!!activeTab.ddlViewer || (managedTypeSource && (!activeTab.typeSourceEditing || unfinishedTypeChange || verifiedTypeDeletion))"
+                  :hide-execution-controls="!!activeTab.ddlViewer || managedTypeSource"
+                  :breakpoints-enabled="breakpointsEnabled"
+                  :breakpoint-lines="breakpointLines"
+                  :debug-hover-members="packageDebugHoverMembers"
+                  :debug-hover-label="t('plDebug.launch.action')"
+                  enable-explain-shortcut
+                  :can-explain="!activeTab.isExecuting && !activeTab.isExplaining && hasExecutableSql"
+                  :is-executing="activeTab.isExecuting"
+                  @update:model-value="emit('editorUpdate', activeTab.id, $event)"
+                  @selection-change="emit('editorSelectionChange', activeTab.id, $event)"
+                  @send-selection-to-ai="emit('sendSelectionToAi', activeTab.id, $event)"
+                  @cursor-change="emit('editorCursorChange', activeTab.id, $event)"
+                  @preview-changes-available="emit('previewChangesAvailable', activeTab.id, $event)"
+                  @viewport-change="(viewport, tabId) => emit('editorViewportChange', tabId ?? activeTab.id, viewport)"
+                  @selection-state-change="emit('editorSelectionStateChange', activeTab.id, $event)"
+                  @editor-state-flushed="emit('editorStateFlushed', activeTab.id)"
+                  @editor-reveal-consumed="clearEditorRevealRequest(activeTab)"
+                  @toggle-breakpoint="toggleRoutineBreakpoint"
+                  @debug-hover="debugHoveredPackageMember"
+                  @format-error="emit('formatError', activeTab.id)"
+                  @execute="sourceSectionActive && emit('execute', activeTab.id, $event)"
+                  @execute-in-new-result-tab="sourceSectionActive && emit('executeInNewResultTab', activeTab.id, $event)"
+                  @explain="sourceSectionActive && emit('explain', activeTab.id)"
+                  @export-query="handleExportQuery"
+                  @save="sourceSectionActive && emit('saveSql', props.activeTab.id)"
+                  @click-table="onHandleClickTable"
+                  @view-table-data="onHandleViewTableData"
+                  @edit-table-structure="onHandleEditTableStructure"
+                  @view-table-ddl="onHandleViewTableDdl"
+                  @open-object-source="onHandleOpenObjectSource"
+                  @click-column="onHandleClickColumn"
+                  @close-column-panel="onHandleCloseColumnPanel"
+                />
+              </div>
               <ColumnInfoPanel
                 v-if="showColumnInfo"
                 :columns="columnInfoColumns"
@@ -4155,6 +4338,14 @@ defineExpose({
       <DamengRoleAdmin :key="activeTab.id" :connection="activeConnection" />
     </template>
 
+    <template v-else-if="activeTab.mode === 'database-stats' && activeConnection">
+      <DatabaseStatsPanel :key="activeTab.id" :connection-id="activeTab.connectionId" :database="activeTab.database" />
+    </template>
+
+    <template v-else-if="activeTab.mode === 'log-browse' && activeConnection">
+      <LogBrowsePanel :key="activeTab.id" :connection-id="activeTab.connectionId" :database="activeTab.database" />
+    </template>
+
     <DataGridSqlPreviewDialog v-if="tableSqlPreview" :preview="tableSqlPreview.preview" :can-open-query="!!tableSqlPreview.connectionId" @close="tableSqlPreview = null" @open-query="openTableSqlInNewQuery" />
     <Dialog v-model:open="resultRunRenameOpen">
       <DialogContent class="sm:max-w-[400px]">
@@ -4165,6 +4356,50 @@ defineExpose({
         <DialogFooter>
           <Button variant="outline" @click="resultRunRenameOpen = false">{{ t("common.cancel") }}</Button>
           <Button :disabled="!resultRunRenameTitle.trim()" @click="saveResultRunRename">{{ t("common.save") }}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+    <Dialog v-model:open="packageMemberDialogOpen">
+      <DialogContent class="sm:max-w-[440px]" data-package-member-create-dialog>
+        <DialogHeader>
+          <DialogTitle>{{ t("plDebug.launch.createTitle") }}</DialogTitle>
+        </DialogHeader>
+        <div class="space-y-3">
+          <label class="block space-y-1 text-xs text-muted-foreground">
+            <span>{{ t("plDebug.launch.kind") }}</span>
+            <select v-model="packageMemberKind" class="h-9 w-full rounded-md border bg-background px-3 text-sm text-foreground">
+              <option value="PROCEDURE">{{ t("common.procedure") }}</option>
+              <option value="FUNCTION">{{ t("common.function") }}</option>
+            </select>
+          </label>
+          <label class="block space-y-1 text-xs text-muted-foreground">
+            <span>{{ t("plDebug.launch.name") }}</span>
+            <Input v-model="packageMemberName" placeholder="member_name" data-package-member-name-input />
+          </label>
+          <label class="block space-y-1 text-xs text-muted-foreground">
+            <span>{{ t("plDebug.launch.parameters") }}</span>
+            <Input v-model="packageMemberParameters" placeholder="p_id IN INTEGER, p_name IN VARCHAR2" />
+          </label>
+          <label v-if="packageMemberKind === 'FUNCTION'" class="block space-y-1 text-xs text-muted-foreground">
+            <span>{{ t("plDebug.start.returnType") }}</span>
+            <Input v-model="packageMemberReturnType" placeholder="INTEGER" />
+          </label>
+        </div>
+        <DialogFooter>
+          <Button variant="outline" @click="packageMemberDialogOpen = false">{{ t("common.cancel") }}</Button>
+          <Button :disabled="packageMemberCreateDisabled" data-package-member-create-confirm @click="createPackageMember">{{ t("plDebug.launch.create") }}</Button>
+        </DialogFooter>
+      </DialogContent>
+    </Dialog>
+    <Dialog v-model:open="packageMemberDeleteOpen">
+      <DialogContent class="sm:max-w-[420px]" data-package-member-delete-dialog>
+        <DialogHeader>
+          <DialogTitle>{{ t("plDebug.launch.deleteTitle") }}</DialogTitle>
+        </DialogHeader>
+        <p class="text-sm text-muted-foreground">{{ t("plDebug.launch.deleteConfirm", { name: packageMemberPendingDelete?.name ?? "" }) }}</p>
+        <DialogFooter>
+          <Button variant="outline" @click="packageMemberDeleteOpen = false">{{ t("common.cancel") }}</Button>
+          <Button variant="destructive" data-package-member-delete-confirm @click="confirmDeletePackageMember">{{ t("common.delete") }}</Button>
         </DialogFooter>
       </DialogContent>
     </Dialog>

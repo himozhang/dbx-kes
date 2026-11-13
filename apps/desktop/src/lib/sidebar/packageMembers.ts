@@ -52,6 +52,13 @@ function packageMemberNode(packageNode: TreeNode, kind: "procedure" | "function"
   };
 }
 
+// Databases that support richer (procedures/functions sub-grouped) package
+// member trees. Xugu pioneered the feature; Kingbase Oracle compatibility now
+// joins it. Pulling the list from the canonical capability Set keeps package
+// tree behaviour in one place — adding a database there automatically opts it
+// into the grouped member layout.
+const PACKAGE_MEMBER_GROUPED_DATABASES: DatabaseType[] = ["xugu", "kingbase", "oracle", "oceanbase-oracle", "dameng", "opengauss"];
+
 export function buildPackageMemberNodes(packageNode: TreeNode, candidates: readonly CompletionAssistantCandidate[], databaseType?: DatabaseType): TreeNode[] {
   const seen = new Set<string>();
   const members: TreeNode[] = [];
@@ -72,10 +79,8 @@ export function buildPackageMemberNodes(packageNode: TreeNode, candidates: reado
     else functions.push(member);
   }
 
-  // Xugu presents package specifications and bodies as one logical package.
-  // Keep the richer member folders scoped to Xugu so Oracle and other package
-  // providers retain their existing flat member tree.
-  if (databaseType !== "xugu") return members;
+  // Flat member tree for databases that don't support richer groups.
+  if (!databaseType || !PACKAGE_MEMBER_GROUPED_DATABASES.includes(databaseType)) return members;
 
   const groups: TreeNode[] = [];
   if (procedures.length > 0) groups.push(packageMemberGroup(packageNode, "procedure", procedures));

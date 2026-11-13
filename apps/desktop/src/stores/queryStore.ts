@@ -174,6 +174,7 @@ import { readOracleTriggerSource, prepareOracleTriggerPlan, type OracleTriggerSn
 import { confirmOracleTriggerPlan } from "@/lib/database/oracleTriggerActions";
 import { restoreOracleTypeManagementDraft, type OracleTypeManagementDraft } from "@/lib/table/oracleTypeManagement";
 import { typeManagementRecordsEqual } from "@/lib/table/oracleTypeManagementRecord";
+import { buildPackageOutline, findPackageOutlineMemberByName } from "@/lib/table/packageSourceMembers";
 import { isOracleFamilyTypeSource, isTriggerSourceSaveSupported } from "@/lib/database/databaseObjectCapabilities";
 import { disposeAllSqlServerActivityTraces, disposeSqlServerActivityTrace } from "@/lib/sqlserver/sqlServerActivityTraceRuntime";
 import type { SavedSqlFile } from "@/types/database";
@@ -334,6 +335,8 @@ interface OpenPendingObjectSourceTabOptions {
   initialEditing?: boolean;
   initialSection?: NonNullable<QueryTab["objectDetails"]>["section"];
   request: ObjectSourceRequestIdentity;
+  /** 包成员节点：复用已打开的包 tab 后定位到该成员在包体中的实现行。 */
+  revealMemberName?: string;
 }
 
 /**
@@ -1181,6 +1184,14 @@ export const useQueryStore = defineStore("query", () => {
   let triggerSourceReadVersion = 0;
   function oracleTriggerSourceState(id: string) {
     return oracleTriggerSources[id];
+  }
+  /** 包 DDL 页左侧大纲点击后，把编辑器定位到包体中的实现行并记住当前成员。 */
+  function revealActiveObjectSourceLine(line: number, packageMemberName?: string): void {
+    if (!Number.isFinite(line) || line < 1) return;
+    const tab = tabs.value.find((candidate) => candidate.id === activeTabId.value);
+    if (!tab) return;
+    if (packageMemberName) tab.packageDebugMemberName = packageMemberName;
+    tab.editorRevealRequest = { id: ++contentRevealSeq, line, column: 1 };
   }
   function revealOracleTriggerSourceError(id: string, location: { line: number; position: number }, expectedObjectId?: string): boolean {
     const tab = tabs.value.find((candidate) => candidate.id === id);
@@ -3277,6 +3288,9 @@ export const useQueryStore = defineStore("query", () => {
    * 解析完成后再回到这里落定，避免改变既有语义。
    */
   function findMatchingObjectSourceTab(options: OpenObjectSourceTabOptions, excludeTabId?: string): QueryTab | undefined {
+    // 包的包头/包体是一个整体：点击包成员（带签名）也必须复用已打开的包 tab，
+    // 否则同一个包会因为成员签名不同而不断新开页签。
+    const packageTab = options.objectSource.objectType === "PACKAGE";
     return tabs.value.find(
       (tab) =>
         tab.id !== excludeTabId &&
@@ -3288,7 +3302,7 @@ export const useQueryStore = defineStore("query", () => {
         tab.objectSource?.name === options.objectSource.name &&
         tab.objectSource.objectType === options.objectSource.objectType &&
         (tab.objectSource.schema || "") === (options.objectSource.schema || "") &&
-        (tab.objectSource.signature || "") === (options.objectSource.signature || ""),
+        (packageTab || (tab.objectSource.signature || "") === (options.objectSource.signature || "")),
     );
   }
 
@@ -3348,6 +3362,7 @@ export const useQueryStore = defineStore("query", () => {
   }
 
   function findPendingObjectSourceTab(options: OpenPendingObjectSourceTabOptions): QueryTab | undefined {
+    const packageTab = options.request.objectType === "PACKAGE";
     return tabs.value.find(
       (tab) =>
         !!tab.sourceLoad &&
@@ -3358,15 +3373,66 @@ export const useQueryStore = defineStore("query", () => {
         (tab.sourceLoad.initialEditing ?? true) === (options.initialEditing ?? true) &&
         tab.sourceLoad.request.name === options.request.name &&
         tab.sourceLoad.request.objectType === options.request.objectType &&
-        (tab.sourceLoad.request.signature || "") === (options.request.signature || ""),
+        (packageTab || (tab.sourceLoad.request.signature || "") === (options.request.signature || "")),
     );
   }
 
   /**
-   * 立即建出源码 tab 并挂上加载态，再异步取源码（issue #9035）。
-   * 此前是「等连接 + 等源码都完成才建 tab」，等待期间没有任何可见 UI，
-   * 用户看到的是点击后毫无反应。
+   * 把包成员定位到包体实现行。包头/包体都是文本，左栏列表由
+   * `buildPackageOutline` 现场解析，因此这里不依赖 UI 层。
    */
+  function applyPackageMemberReveal(tab: QueryTab, memberName: string): boolean {
+    if (!memberName || !tab.packageHeaderSource || !tab.sql.trim()) return false;
+    const members = buildPackageOutline(tab.packageHeaderSource, tab.sql);
+    const member = findPackageOutlineMemberByName(members, memberName);
+    if (!member) return false;
+    tab.packageDebugMemberName = member.name;
+    tab.editorRevealRequest = { id: ++contentRevealSeq, line: member.bodyLine ?? member.line, column: 1 };
+    return true;
+  }
+
+  function revealPendingPackageMember(tab: QueryTab): void {
+    const memberName = tab.pendingPackageMemberName;
+    if (!memberName) return;
+    tab.pendingPackageMemberName = undefined;
+    applyPackageMemberReveal(tab, memberName);
+  }
+
+  /**
+   * 点击包节点本身（而不是某个成员）时，复用已打开的包 DDL 页并回到包体开头：
+   * 清掉成员高亮，让编辑器从 `CREATE ... PACKAGE BODY` 第一行开始展示。
+   */
+  function revealPackageBodyStart(tab: QueryTab): void {
+    if (tab.objectSource?.objectType !== "PACKAGE") return;
+    tab.pendingPackageMemberName = undefined;
+    tab.packageDebugMemberName = undefined;
+    tab.editorRevealRequest = { id: ++contentRevealSeq, line: 1, column: 1 };
+  }
+
+  /**
+   * KES 包头与包体分开存储（sys_package.pkgspecsrc / pkgbodysrc）。包 DDL 页展示
+   * 包体，左侧大纲用包头声明建立列表；包体读不到时返回 undefined，由调用方决定
+   * 回退到包头还是保留当前内容。
+   */
+  async function loadKingbasePackageBodySource(args: { connectionId: string; database: string; schema: string; name: string; signature?: string; databaseType: DatabaseType; headerSource: string }): Promise<{ editableSource: string; packageHeaderSource: string } | undefined> {
+    try {
+      const body = await api.getObjectSource(args.connectionId, args.database, args.schema, args.name, "PACKAGE_BODY", args.signature);
+      if (!body.source?.trim()) return undefined;
+      return {
+        packageHeaderSource: args.headerSource,
+        editableSource: await buildEditableObjectSource({
+          databaseType: args.databaseType,
+          objectType: "PACKAGE_BODY",
+          schema: args.schema,
+          name: args.name,
+          source: body.source,
+        }),
+      };
+    } catch {
+      return undefined;
+    }
+  }
+
   function openObjectSourceTabPending(options: OpenPendingObjectSourceTabOptions): string {
     // 这个对象已经打开过：立刻切过去，再在后台重新校验源码。
     // 两条弯路都要避开 —— 再建一个 pending tab 会让界面上多出一个转圈 tab，
@@ -3389,6 +3455,15 @@ export const useQueryStore = defineStore("query", () => {
       switchTab(loaded.id);
       // 这条路径不经过 ensureConnected，但树上的动作会把该连接设为当前连接
       useConnectionStore().activeConnectionId = options.connectionId;
+      if (options.revealMemberName) {
+        // 立即定位一次（内容已在本地），同时保留 pending：后台重新校验后
+        // 包体行号可能变化，revalidate 完成时会再定位一次。
+        loaded.pendingPackageMemberName = options.revealMemberName;
+        applyPackageMemberReveal(loaded, options.revealMemberName);
+      } else {
+        // 点的是包节点本身：复用页签后回到包体开头。
+        revealPackageBodyStart(loaded);
+      }
       void revalidateObjectSourceTab(loaded.id);
       return loaded.id;
     }
@@ -3396,6 +3471,7 @@ export const useQueryStore = defineStore("query", () => {
     const existing = findPendingObjectSourceTab(options);
     if (existing) {
       existing.objectDetails = sourceDetails(options, options.request, options.initialSection);
+      if (options.revealMemberName) existing.pendingPackageMemberName = options.revealMemberName;
       switchTab(existing.id);
       // 再次点击同一对象 = 再试一次，不新开 tab、不重复占用一个 tab 位
       if (existing.sourceLoad?.error) retryObjectSourceTab(existing.id);
@@ -3420,6 +3496,7 @@ export const useQueryStore = defineStore("query", () => {
     if (tab) {
       tab.sourceLoad = { startedAt: Date.now(), initialEditing: options.initialEditing, request: { ...options.request } };
       tab.objectDetails = sourceDetails(options, options.request, options.initialSection);
+      if (options.revealMemberName) tab.pendingPackageMemberName = options.revealMemberName;
     }
     void loadObjectSourceIntoTab(id);
     return id;
@@ -3468,13 +3545,42 @@ export const useQueryStore = defineStore("query", () => {
       if (raw.editable === false || (OBJECT_SOURCE_READ_ONLY_TYPES.includes(resolvedType) && !(databaseType === "oceanbase-oracle" && resolvedType === "SEQUENCE") && !isOracleFamilyTypeSource(databaseType, resolvedType) && !(resolvedType === "TRIGGER" && isTriggerSourceSaveSupported(databaseType))))
         return;
       if (isTabDirty(current)) return;
-      updateSql(id, editableSource);
+      // 包的编辑区是包体而不是包头：刷新时必须重新读取包体，否则会把 body
+      // 覆盖成 header。包体暂时读不到时保留现有内容，避免闪回 header。
+      let refreshedSource = editableSource;
+      let packageHeaderSource: string | undefined;
+      if (resolvedType === "PACKAGE" && databaseType === "kingbase" && raw.source?.trim()) {
+        const packageBody = await loadKingbasePackageBodySource({
+          connectionId,
+          database,
+          schema,
+          name: objectSource.name,
+          signature: objectSource.signature,
+          databaseType,
+          headerSource: raw.source,
+        });
+        if (!packageBody) return;
+        refreshedSource = packageBody.editableSource;
+        packageHeaderSource = packageBody.packageHeaderSource;
+      }
+      updateSql(id, refreshedSource);
+      current.packageHeaderSource = packageHeaderSource;
       markTabClean(current);
+      revealPendingPackageMember(current);
     } catch {
       // 已有的源码依然可用，静默保留
     } finally {
       sourceRevalidateInFlight.delete(id);
     }
+  }
+
+  /**
+   * 包 DDL 页左侧列表增删成员时同步包头源码。包体走常规 editorUpdate，
+   * 包头不参与编辑区，所以单独写入 tab 状态。
+   */
+  function setPackageHeaderSource(id: string, source: string | undefined): void {
+    const tab = tabs.value.find((candidate) => candidate.id === id);
+    if (tab) tab.packageHeaderSource = source;
   }
 
   function retryObjectSourceTab(id: string) {
@@ -3584,7 +3690,7 @@ export const useQueryStore = defineStore("query", () => {
       const triggerLoaded = triggerOptions ? await readOracleTriggerSource({ connectionId, database, catalog: tab.catalog, owner: schema, name: request.name, executionSchema: tab.schema || database }) : undefined;
       const {
         raw,
-        editableSource,
+        editableSource: loadedEditableSource,
         objectType: resolvedType,
       } = await loadEditableObjectSourceForEditor(triggerLoaded ? async () => triggerLoaded.raw : api.getObjectSource, buildEditableObjectSource, {
         connectionId,
@@ -3597,13 +3703,32 @@ export const useQueryStore = defineStore("query", () => {
         signature: request.signature,
         metadataReadOptions: triggerOptions,
       });
+      // KES 的包头与包体分开存储。包 DDL 页编辑区展示包体，左侧大纲再用包头声明
+      // 建立对象列表；包体读取失败时回退为包头，保持原行为。
+      let editableSource = loadedEditableSource;
+      let packageHeaderSource: string | undefined;
+      if (resolvedType === "PACKAGE" && databaseType === "kingbase" && raw.source?.trim()) {
+        const packageBody = await loadKingbasePackageBodySource({
+          connectionId,
+          database,
+          schema,
+          name: request.name,
+          signature: request.signature,
+          databaseType,
+          headerSource: raw.source,
+        });
+        if (packageBody) {
+          editableSource = packageBody.editableSource;
+          packageHeaderSource = packageBody.packageHeaderSource;
+        }
+      }
       if (tabs.value.find((candidate) => candidate.id === id)?.sourceLoad !== sourceLoad) return;
       if (tab.connectionId !== connectionId || tab.database !== database || (tab.schema || tab.database) !== schema) throw new Error(i18n.global.t("objects.sourceIdentityChanged"));
       const renewedIdentity = triggerLoaded?.snapshot?.identity ?? renewSourceIdentity(identity);
       // Fallback can resolve another kind; never activate a frozen resolved object.
       const resolvedIdentity = resolvedType === request.objectType ? renewedIdentity : captureSourceIdentity({ ...identity, objectType: resolvedType });
       assertSourceIdentity(resolvedIdentity);
-      applyLoadedObjectSource(id, { connectionId, database, schema, catalog: tab.catalog, title: tab.title, request, initialEditing, databaseType, editableSource, raw, resolvedType, triggerBaseline: triggerLoaded?.snapshot, triggerError: triggerLoaded?.identityError });
+      applyLoadedObjectSource(id, { connectionId, database, schema, catalog: tab.catalog, title: tab.title, request, initialEditing, databaseType, editableSource, packageHeaderSource, raw, resolvedType, triggerBaseline: triggerLoaded?.snapshot, triggerError: triggerLoaded?.identityError });
       const loadedTab = tabs.value.find((candidate) => candidate.id === id);
       if (loadedTab?.objectSource) sourceIdentities.set(loadedTab.objectSource, resolvedIdentity);
     } catch (e: any) {
@@ -3625,6 +3750,8 @@ export const useQueryStore = defineStore("query", () => {
       initialEditing?: boolean;
       databaseType: DatabaseType;
       editableSource: string;
+      /** 包 DDL 页的包头源码；编辑区展示的是包体。 */
+      packageHeaderSource?: string;
       raw: ObjectSource;
       resolvedType: ObjectSourceKind;
       triggerBaseline?: OracleTriggerSnapshot;
@@ -3667,18 +3794,24 @@ export const useQueryStore = defineStore("query", () => {
         existing.sourceView = true;
         if (managedType && loaded.initialEditing === true) existing.typeSourceEditing = true;
         existing.objectDetails = details;
+        existing.packageHeaderSource = loaded.packageHeaderSource;
+        if (tab.pendingPackageMemberName) existing.pendingPackageMemberName = tab.pendingPackageMemberName;
         switchTab(existing.id);
         if (!isTabDirty(existing)) {
           updateSql(existing.id, loaded.editableSource);
           markTabClean(existing);
         }
+        revealPendingPackageMember(existing);
         return;
       }
       updateSql(id, loaded.editableSource);
       setObjectSource(id, options.objectSource);
+      tab.packageHeaderSource = loaded.packageHeaderSource;
       if (managedType) tab.typeSourceEditing = loaded.initialEditing === true;
+      revealPendingPackageMember(tab);
     } else {
       updateSql(id, loaded.raw.source);
+      tab.packageHeaderSource = undefined;
     }
     tab.sourceView = true;
     tab.objectDetails = details;
@@ -4313,6 +4446,24 @@ export const useQueryStore = defineStore("query", () => {
       return id;
     }
     return registerOpenTab({ id: uuid(), title: t("nativeJobs.title"), connectionId, database: "", sql: "", isExecuting: false, isCancelling: false, isExplaining: false, mode: "database-jobs", ...(selection ? { nativeJobAdmin: nativeJobAdminSelection(selection) } : {}) });
+  }
+
+  function openDatabaseStats(connectionId: string, database: string) {
+    const existing = tabs.value.find((tab) => tab.mode === "database-stats" && tab.connectionId === connectionId);
+    if (existing) {
+      switchTab(existing.id);
+      return existing.id;
+    }
+    return registerOpenTab({ id: uuid(), title: "数据库性能", connectionId, database, sql: "", isExecuting: false, isCancelling: false, isExplaining: false, mode: "database-stats" });
+  }
+
+  function openLogBrowse(connectionId: string, database: string) {
+    const existing = tabs.value.find((tab) => tab.mode === "log-browse" && tab.connectionId === connectionId);
+    if (existing) {
+      switchTab(existing.id);
+      return existing.id;
+    }
+    return registerOpenTab({ id: uuid(), title: "日志浏览", connectionId, database, sql: "", isExecuting: false, isCancelling: false, isExplaining: false, mode: "log-browse" });
   }
 
   function openDamengUsers(connectionId: string) {
@@ -11992,7 +12143,9 @@ export const useQueryStore = defineStore("query", () => {
     openObjectSourceTab,
     openObjectSourceTabPending,
     retryObjectSourceTab,
+    revealActiveObjectSourceLine,
     refreshObjectSourceTab,
+    setPackageHeaderSource,
     loadDdlViewerTab,
     retryDdlViewerTab,
     showExecutedQueryResults,
@@ -12102,6 +12255,8 @@ export const useQueryStore = defineStore("query", () => {
     openDamengRoles,
     openDamengJobAdmin,
     openDatabaseJobAdmin,
+    openDatabaseStats,
+    openLogBrowse,
     openMqAdmin,
     openMqttAdmin,
     openNacosAdmin,

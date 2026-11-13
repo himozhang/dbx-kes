@@ -10,7 +10,7 @@ export type ActiveTabSidebarTarget =
   | {
       type: "management";
       connectionId: string;
-      nodeType: "user-admin" | "xugu-user-admin" | "dameng-users" | "dameng-roles" | "dameng-job-admin" | "database-job-admin";
+      nodeType: "user-admin" | "xugu-user-admin" | "dameng-users" | "dameng-roles" | "dameng-job-admin" | "database-job-admin" | "group-database-stats" | "group-log-browse";
     }
   | {
       type: "table";
@@ -132,6 +132,8 @@ export function activeTabSidebarTarget(tab: QueryTab | undefined | null): Active
     "dameng-roles": "dameng-roles",
     "dameng-jobs": "dameng-job-admin",
     "database-jobs": "database-job-admin",
+    "database-stats": "group-database-stats",
+    "log-browse": "group-log-browse",
   } as const;
   if (Object.prototype.hasOwnProperty.call(managementNodeTypes, tab.mode)) {
     if (!tab.connectionId) return null;

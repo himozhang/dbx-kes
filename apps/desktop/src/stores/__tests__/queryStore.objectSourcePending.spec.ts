@@ -56,6 +56,10 @@ const objectSource = (source: string, editable?: boolean) => ({
 
 /** 让 loader 的 await 链跑完（ensureConnected → getObjectSource → 落地）。 */
 const settle = () => new Promise((resolve) => setTimeout(resolve, 0));
+/** 多层 await 链（包头 → 包体 → 可编辑源码）需要多轮微/宏任务。 */
+const flush = async (times = 8) => {
+  for (let index = 0; index < times; index += 1) await settle();
+};
 
 describe("queryStore pending object source tab", () => {
   beforeEach(() => {
@@ -516,6 +520,43 @@ describe("queryStore pending object source tab", () => {
     expect(store.tabs).toHaveLength(1);
   });
 
+  it("shows the kingbase package body and keeps the header source for the outline", async () => {
+    mocks.connectionStore.dbType = "kingbase";
+    const header = "CREATE OR REPLACE PACKAGE demo_pkg AS PROCEDURE run; END demo_pkg;";
+    const body = "CREATE OR REPLACE PACKAGE BODY demo_pkg AS PROCEDURE run IS BEGIN NULL; END; END demo_pkg;";
+    mocks.getObjectSource.mockImplementation(async (_connectionId, _database, _schema, _name, objectType: string) => objectSource(objectType === "PACKAGE" ? header : body));
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+
+    store.openObjectSourceTabPending(pendingOptions({ name: "demo_pkg", objectType: "PACKAGE" }));
+    await settle();
+
+    const tab = store.tabs[0]!;
+    expect(mocks.getObjectSource).toHaveBeenCalledWith(CONNECTION_ID, DATABASE, SCHEMA, "demo_pkg", "PACKAGE_BODY", undefined);
+    expect(tab.sql).toBe(body);
+    expect(tab.packageHeaderSource).toBe(header);
+    // tab 身份仍是用户点击的 PACKAGE，重复点击才能复用同一个 tab。
+    expect(tab.objectSource).toMatchObject({ schema: SCHEMA, name: "demo_pkg", objectType: "PACKAGE" });
+  });
+
+  it("falls back to the kingbase package header when the body cannot be read", async () => {
+    mocks.connectionStore.dbType = "kingbase";
+    const header = "CREATE OR REPLACE PACKAGE demo_pkg AS PROCEDURE run; END demo_pkg;";
+    mocks.getObjectSource.mockImplementation(async (_connectionId, _database, _schema, _name, objectType: string) => {
+      if (objectType === "PACKAGE_BODY") throw new Error("package body permission denied");
+      return objectSource(header);
+    });
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+
+    store.openObjectSourceTabPending(pendingOptions({ name: "demo_pkg", objectType: "PACKAGE" }));
+    await settle();
+
+    const tab = store.tabs[0]!;
+    expect(tab.sql).toBe(header);
+    expect(tab.packageHeaderSource).toBeUndefined();
+  });
+
   it("reuses a view-only sequence tab on repeated view opens", async () => {
     mocks.connectionStore.dbType = "oceanbase-oracle";
     mocks.getObjectSource.mockResolvedValue(objectSource('CREATE SEQUENCE "APP"."SEQ_USERS" START WITH 10 INCREMENT BY 2'));
@@ -560,5 +601,84 @@ describe("queryStore pending object source tab", () => {
     await settle();
     expect(store.tabs).toHaveLength(2);
     expect(store.tabs[1]?.sql).toBe('ALTER SEQUENCE "APP"."SEQ_USERS" INCREMENT BY 4');
+  });
+
+  // KES 把包头与包体分开存储：包 DDL 页右侧必须是完整包体，左侧大纲来自包头，
+  // 再点包成员复用同一页签并定位到包体实现行。
+  const packageHeader = `CREATE OR REPLACE PACKAGE "APP"."DEMO_PKG" AS
+  PROCEDURE create_order(p_id integer);
+  PROCEDURE missing_impl;
+END demo_pkg;`;
+  const packageBody = `CREATE OR REPLACE PACKAGE BODY "APP"."DEMO_PKG" AS
+  PROCEDURE create_order(p_id integer) IS
+  BEGIN
+    NULL;
+  END;
+END demo_pkg;`;
+
+  const mockKingbasePackageSources = () => {
+    mocks.connectionStore.dbType = "kingbase";
+    mocks.buildEditableObjectSource.mockImplementation(async (input: { source: string }) => input.source);
+    mocks.getObjectSource.mockImplementation(async (...args: unknown[]) => {
+      const name = String(args[3]);
+      const objectType = String(args[4]);
+      return { name, object_type: objectType, source: objectType === "PACKAGE_BODY" ? packageBody : packageHeader };
+    });
+  };
+
+  it("opens a KES package with its body and reveals a clicked member in the same tab", async () => {
+    mockKingbasePackageSources();
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const base = pendingOptions({ name: "DEMO_PKG", objectType: "PACKAGE" });
+    const id = store.openObjectSourceTabPending(base);
+    await flush();
+
+    const tab = store.tabs[0]!;
+    expect(tab.id).toBe(id);
+    expect(tab.sql).toBe(packageBody);
+    expect(tab.packageHeaderSource).toBe(packageHeader);
+    expect(tab.objectSource).toMatchObject({ name: "DEMO_PKG", objectType: "PACKAGE" });
+
+    const memberOptions = { ...pendingOptions({ name: "DEMO_PKG", objectType: "PACKAGE", signature: "p_id integer" }), revealMemberName: "create_order" };
+    expect(store.openObjectSourceTabPending(memberOptions)).toBe(id);
+    expect(store.tabs).toHaveLength(1);
+    expect(store.tabs[0]?.packageDebugMemberName).toBe("create_order");
+    expect(store.tabs[0]?.editorRevealRequest?.line).toBe(2);
+  });
+
+  it("keeps the KES package body when reopening the package revalidates the source", async () => {
+    mockKingbasePackageSources();
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const base = pendingOptions({ name: "DEMO_PKG", objectType: "PACKAGE" });
+    const id = store.openObjectSourceTabPending(base);
+    await flush();
+
+    expect(store.openObjectSourceTabPending(base)).toBe(id);
+    await flush();
+
+    expect(store.tabs).toHaveLength(1);
+    expect(store.tabs[0]?.sql).toBe(packageBody);
+    expect(store.tabs[0]?.packageHeaderSource).toBe(packageHeader);
+  });
+
+  it("returns to the package body start when clicking the package node itself", async () => {
+    mockKingbasePackageSources();
+    const { useQueryStore } = await import("@/stores/queryStore");
+    const store = useQueryStore();
+    const id = store.openObjectSourceTabPending(pendingOptions({ name: "DEMO_PKG", objectType: "PACKAGE" }));
+    await flush();
+    store.openObjectSourceTabPending({ ...pendingOptions({ name: "DEMO_PKG", objectType: "PACKAGE" }), revealMemberName: "create_order" });
+    expect(store.tabs[0]?.packageDebugMemberName).toBe("create_order");
+    expect(store.tabs[0]?.editorRevealRequest?.line).toBe(2);
+
+    expect(store.openObjectSourceTabPending(pendingOptions({ name: "DEMO_PKG", objectType: "PACKAGE" }))).toBe(id);
+    await flush();
+
+    expect(store.tabs).toHaveLength(1);
+    expect(store.tabs[0]?.sql).toBe(packageBody);
+    expect(store.tabs[0]?.packageDebugMemberName).toBeUndefined();
+    expect(store.tabs[0]?.editorRevealRequest?.line).toBe(1);
   });
 });

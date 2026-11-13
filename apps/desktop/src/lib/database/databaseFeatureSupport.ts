@@ -235,8 +235,11 @@ export function supportsObjectBrowser(dbType?: DatabaseType): boolean {
   return supportsDatabaseFeature(dbType, "objectBrowser");
 }
 
-export function supportsPlDebugRoutine(dbType?: DatabaseType): boolean {
-  return dbType === "oracle" || dbType === "oceanbase-oracle";
+export function supportsPlDebugRoutine(dbType?: DatabaseType, _compatibilityMode?: string): boolean {
+  if (dbType === "oracle" || dbType === "oceanbase-oracle") return true;
+  // Kingbase exposes pldbgapi in both PG and Oracle compatibility modes.
+  if (dbType === "kingbase") return true;
+  return false;
 }
 
 export function supportsConnectionDatabaseBrowser(dbType?: DatabaseType): boolean {

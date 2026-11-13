@@ -51,7 +51,20 @@ const toggleLeafNodeTypes = new Set<TreeNodeType>([
 // These are application entry points rather than database objects. They should
 // always navigate on a single click, even when the user prefers double-click
 // activation for ordinary tree objects.
-const directNavigationTreeNodeTypes = new Set<TreeNodeType>(["consul-root", "consul-overview", "etcd-root", "etcd-dashboard", "etcd-access-control", "nacos-namespace", "nacos-access-control", "meilisearch-system", "dameng-job-admin", "database-job-admin"]);
+const directNavigationTreeNodeTypes = new Set<TreeNodeType>([
+  "consul-root",
+  "consul-overview",
+  "etcd-root",
+  "etcd-dashboard",
+  "etcd-access-control",
+  "nacos-namespace",
+  "nacos-access-control",
+  "meilisearch-system",
+  "dameng-job-admin",
+  "database-job-admin",
+  "group-database-stats",
+  "group-log-browse",
+]);
 const repeatableNavigationTreeNodeTypes = new Set<TreeNodeType>(["etcd-root", "etcd-dashboard", "etcd-access-control", "nacos-namespace", "nacos-access-control"]);
 
 export function isDirectNavigationTreeNode(type: TreeNodeType): boolean {
@@ -129,6 +142,8 @@ export interface TreeNodeObjectSourceTarget {
   schema?: string;
   objectType: ObjectSourceKind;
   signature?: string;
+  /** 包成员节点：包 DDL 打开后定位到该成员在包体中的实现行。 */
+  memberName?: string;
 }
 
 export function objectSourceTargetForTreeNode(node: TreeNode): TreeNodeObjectSourceTarget | null {
@@ -138,6 +153,7 @@ export function objectSourceTargetForTreeNode(node: TreeNode): TreeNodeObjectSou
       schema: node.parentSchema || node.schema,
       objectType: "PACKAGE",
       signature: node.signature,
+      memberName: node.objectName || node.label,
     };
   }
   const objectType = objectSourceKindForTreeNode(node.type);

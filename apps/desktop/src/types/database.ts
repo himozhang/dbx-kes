@@ -2191,6 +2191,11 @@ export type TreeNodeType =
   | "dameng-roles"
   | "dameng-job-admin"
   | "database-job-admin"
+  | "group-database-stats"
+  | "group-log-browse"
+  | "database-stats-top-sql"
+  | "database-stats-activity"
+  | "database-log-files"
   | "saved-sql-root"
   | "saved-sql-folder"
   | "saved-sql-file"
@@ -2769,6 +2774,8 @@ export interface QueryTab {
     | "dolt-version-control"
     | "plugin-workbench"
     | "plugin-filesystem"
+    | "database-stats"
+    | "log-browse"
     | "database-search";
   pluginWorkbench?: {
     /** Host command that created this tab; distinct commands can share a workbench. */
@@ -2847,7 +2854,7 @@ export interface QueryTab {
     catalog?: string;
     name: string;
     objectType: ObjectSourceKind;
-    section: "source" | "dependencies" | "dependents" | "foreignKeys" | "ownership";
+    section: "source" | "dependencies" | "dependents" | "foreignKeys" | "ownership" | "testCases";
   };
   ddlViewer?: {
     schema?: string;
@@ -2877,6 +2884,18 @@ export interface QueryTab {
     objectType: ObjectSourceKind;
     signature?: string;
   };
+  /**
+   * 包 DDL 页：编辑区展示包体，左侧大纲用这里的包头源码解析声明。
+   * 读取不到包体时为空，编辑区仍展示包头。
+   */
+  packageHeaderSource?: string;
+  /** 包 DDL 页左侧大纲当前选中的成员，顶部“调试”按钮据此启动。 */
+  packageDebugMemberName?: string;
+  /**
+   * 从侧边栏再次点击包成员时记录的目标成员：包源码加载完成后定位到它在包体中的
+   * 实现行，然后清空。
+   */
+  pendingPackageMemberName?: string;
   /** Durable TYPE definitions and step records; restored plans require fresh verification. */
   typeManagementDraft?: import("@/lib/table/oracleTypeManagement").OracleTypeManagementDraft;
   /** Explicit edit mode; TYPE source opens read-only and restores read-only. */

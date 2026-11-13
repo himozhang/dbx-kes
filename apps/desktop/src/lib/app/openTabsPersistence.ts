@@ -74,6 +74,8 @@ export interface SavedOpenTab {
   databaseSearchState?: QueryTab["databaseSearchState"];
   objectBrowser?: QueryTab["objectBrowser"];
   objectSource?: QueryTab["objectSource"];
+  /** 包 DDL 页左侧大纲来自包头声明；包体本身存在 sql 里，两者一起恢复才能保住左右布局。 */
+  packageHeaderSource?: string;
   typeManagementDraft?: QueryTab["typeManagementDraft"];
   objectDetails?: QueryTab["objectDetails"];
   sourceView?: boolean;
@@ -228,6 +230,7 @@ export function serializeOpenTabs(tabs: QueryTab[]): SavedOpenTab[] {
     ...(tab.databaseSearchState ? { databaseSearchState: tab.databaseSearchState } : {}),
     objectBrowser: tab.objectBrowser,
     objectSource: tab.objectSource,
+    ...(tab.packageHeaderSource ? { packageHeaderSource: tab.packageHeaderSource } : {}),
     ...(tab.typeManagementDraft ? { typeManagementDraft: JSON.parse(JSON.stringify(tab.typeManagementDraft)) } : {}),
     ...(tab.objectDetails ? { objectDetails: { ...tab.objectDetails } } : {}),
     ...(tab.sourceView ? { sourceView: true } : {}),

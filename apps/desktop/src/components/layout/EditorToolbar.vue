@@ -14,6 +14,7 @@ import {
   AlignLeft,
   GitBranch,
   Save,
+  Bug,
   FolderOpen,
   X,
   Shield,
@@ -63,6 +64,8 @@ import { formatShortcutDisplay, formatShortcutTooltip } from "@/lib/editor/short
 import { resolveNextEditorToolbarTier, type EditorToolbarTier } from "@/lib/tabs/editorToolbarLayout";
 import { canSaveSqlTab } from "@/lib/tabs/sqlTabSaveTarget";
 import { canSaveRoutineToDatabase } from "@/lib/table/routineDefinitionSave";
+import { supportsPlDebugRoutine } from "@/lib/database/databaseFeatureSupport";
+import { launchPlDebug } from "@/components/debug/plDebugLaunch";
 import { canFormatSqlForDatabaseType } from "@/lib/sql/sqlFormatter";
 import { copyToClipboard } from "@/lib/common/clipboard";
 import { useToast } from "@/composables/useToast";
@@ -386,6 +389,25 @@ const explainAnalyzeTooltip = computed(() => {
 });
 const canSaveSql = computed(() => canSaveSqlTab(props.activeTab));
 const showSaveRoutineToDatabase = computed(() => canSaveRoutineToDatabase(props.activeTab, props.activeConnection));
+/** 函数/存储过程的 DDL 页顶部工具条的调试入口；包 DDL 页只提供逐成员调试，不再显示整体“调试”。 */
+const showDebugRoutine = computed(() => {
+  const objectType = props.activeTab.objectSource?.objectType?.toUpperCase();
+  if (objectType !== "PROCEDURE" && objectType !== "FUNCTION") return false;
+  return supportsPlDebugRoutine(props.activeConnection?.db_type, props.activeConnection?.database_info?.compatibilityMode);
+});
+function debugRoutine() {
+  const objectSource = props.activeTab.objectSource;
+  const connection = props.activeConnection;
+  if (!objectSource || !connection) return;
+  void launchPlDebug({
+    connectionId: connection.id,
+    database: props.activeTab.database,
+    databaseType: connection.db_type,
+    schema: objectSource.schema ?? props.activeTab.schema,
+    objectType: objectSource.objectType,
+    objectName: objectSource.name,
+  });
+}
 watch(showSaveRoutineToDatabase, () => void nextTick(scheduleToolbarMeasurement));
 const keywordCaseIsLower = computed(() => props.sqlKeywordCase === "lower");
 const keywordCaseToggleTooltip = computed(() => (keywordCaseIsLower.value ? t("toolbar.keywordCaseUpper") : t("toolbar.keywordCaseLower")));
@@ -876,6 +898,10 @@ defineExpose({
       >
         <Save class="h-3.5 w-3.5" />
         {{ t("toolbar.saveRoutineToDatabase") }}
+      </Button>
+      <Button v-if="showDebugRoutine" variant="ghost" size="sm" class="h-6 shrink-0 gap-1 px-2 text-xs text-emerald-600 hover:bg-emerald-500/10 hover:text-emerald-700 dark:text-emerald-300 dark:hover:text-emerald-200" :aria-label="t('toolbar.debugRoutine')" @click="debugRoutine">
+        <Bug class="h-3.5 w-3.5" />
+        {{ t("toolbar.debugRoutine") }}
       </Button>
       <Tooltip>
         <TooltipTrigger as-child>

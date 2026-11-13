@@ -30,7 +30,13 @@ const POSTGRES_NO_TYPE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIA
 // catalogs over the agent connection (t8y2/dbx#9016). Kingbase additionally has
 // a verified schema-trigger path; keep Vastbase separate until its Agent
 // exposes the same parent-table-aware metadata contract.
-const KINGBASE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE", "TYPE"];
+// Kingbase always exposes PACKAGE regardless of compatibility
+// mode (sys_catalog.sys_package exists in both PG and Oracle modes). The
+// specification and the body are two facets of one package, so the tree shows
+// a single "程序包" group and never a separate package-body group.
+const KINGBASE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE", "PACKAGE", "TYPE"];
+// Kingbase in Oracle compatibility mode additionally exposes user-defined types.
+const KINGBASE_ORACLE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE", "PACKAGE", "TYPE"];
 const VASTBASE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION", "SEQUENCE", "TYPE"];
 
 const POSTGRES_LIKE_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "MATERIALIZED_VIEW", "PROCEDURE", "FUNCTION"];
@@ -43,7 +49,7 @@ export function supportsSchemaIndexManagement(dbType?: DatabaseType): boolean {
 }
 const XUGU_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "PROCEDURE", "FUNCTION", "TRIGGER", "SEQUENCE", "SYNONYM", "PACKAGE", "PACKAGE_BODY", "TYPE", "TYPE_BODY"];
 const FIREBIRD_OBJECTS: SidebarObjectKind[] = ["TABLE", "VIEW", "PROCEDURE", "FUNCTION_INTERNAL", "FUNCTION_UDF", "TRIGGER", "SEQUENCE", "INDEX", "PACKAGE"];
-const PACKAGE_MEMBER_EXPANSION_DATABASES = new Set<DatabaseType>(["oracle", "oceanbase-oracle", "xugu"]);
+const PACKAGE_MEMBER_EXPANSION_DATABASES = new Set<DatabaseType>(["oracle", "oceanbase-oracle", "xugu", "kingbase"]);
 
 const DATABASE_TYPE_OBJECTS = new Map<DatabaseType, SidebarObjectKind[]>([
   // postgres
@@ -197,6 +203,7 @@ export function schemaDiffRoutineObjectTypesIntersection(sourceDbType?: Database
 export function sidebarObjectKindsForDatabase(dbType?: DatabaseType, compatibilityMode?: string): SidebarObjectKind[] {
   if (!dbType) return [...TABLE_VIEW_OBJECTS];
   if (dbType === "opengauss" && compatibilityMode?.trim().toUpperCase() === "A") return [...OPENGAUSS_A_OBJECTS];
+  if (dbType === "kingbase" && compatibilityMode?.trim().toLowerCase() === "oracle") return [...KINGBASE_ORACLE_OBJECTS];
   return DATABASE_TYPE_OBJECTS.get(dbType) ?? [...ROUTINE_OBJECTS];
 }
 
@@ -257,6 +264,15 @@ export function supportsOracleTypeAttributeExpansion(dbType?: DatabaseType): boo
 
 export function supportsPackageMemberExpansion(dbType?: DatabaseType, compatibilityMode?: string): boolean {
   return !!dbType && (PACKAGE_MEMBER_EXPANSION_DATABASES.has(dbType) || (dbType === "opengauss" && compatibilityMode?.trim().toUpperCase() === "A"));
+}
+
+/**
+ * Whether the connection can persist PL/SQL test cases back to the target
+ * database. All KingbaseES connections qualify — the agent creates a metadata
+ * table (public.dbx_plsql_test_cases) on first use, in both PG and Oracle modes.
+ */
+export function supportsPlsqlTestCases(dbType?: DatabaseType): boolean {
+  return dbType === "kingbase";
 }
 
 export function normalizeSidebarObjectKind(type: string): SidebarObjectKind {
